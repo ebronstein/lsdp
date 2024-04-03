@@ -1,0 +1,3 @@
+[submodule "PyTorch_VAE"]
+	path = PyTorch_VAE
+	url = git@github.com:AntixK/PyTorch-VAE.git
