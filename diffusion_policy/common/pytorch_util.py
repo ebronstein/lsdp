@@ -90,3 +90,15 @@ def optimizer_to(optimizer, device):
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device=device)
     return optimizer
+
+
+def compute_conv_output_shape(
+    H, W, padding, stride, kernel_size, dilation, num_layers, last_hidden_dim
+):
+    for _ in range(num_layers):
+        # Apply the formula for each layer
+        H = ((H + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
+        W = ((W + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
+
+    # Final output dimensions
+    return (last_hidden_dim, H, W)
