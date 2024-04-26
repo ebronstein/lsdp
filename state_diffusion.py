@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 from tqdm.notebook import tqdm, trange
 
 import wandb
+from diffusion_policy.common.pytorch_util import compute_conv_output_shape
 from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 from diffusion_policy.model.diffusion import conditional_unet1d
@@ -195,6 +196,117 @@ class EpisodeDataset(Dataset):
         #     pred_horizon[key] = torch.tensor(value, dtype=torch.float32)
 
         return obs_history, pred_horizon
+
+
+class VanillaVAE(models.VanillaVAE):
+
+    def __init__(
+        self,
+        in_channels: int,
+        in_height: int,
+        in_width: int,
+        latent_dim: int,
+        hidden_dims: Optional[list] = None,
+        **kwargs,
+    ) -> None:
+        models.BaseVAE.__init__(self)
+
+        self.latent_dim = latent_dim
+
+        modules = []
+        if hidden_dims is None:
+            hidden_dims = [32, 64, 128, 256, 512]
+
+        # Build Encoder
+        kernel_size = 3
+        stride = 2
+        padding = 1
+        dilation = 1
+        for h_dim in hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels=h_dim,
+                        kernel_size=kernel_size,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                    ),
+                    nn.BatchNorm2d(h_dim),
+                    nn.LeakyReLU(),
+                )
+            )
+            in_channels = h_dim
+
+        self.conv_out_shape = compute_conv_output_shape(
+            H=in_height,
+            W=in_width,
+            padding=padding,
+            stride=stride,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            num_layers=len(hidden_dims),
+            last_hidden_dim=hidden_dims[-1],
+        )
+        conv_out_size = np.prod(self.conv_out_shape)
+
+        self.encoder = nn.Sequential(*modules)
+        self.fc_mu = nn.Linear(conv_out_size, latent_dim)
+        self.fc_var = nn.Linear(conv_out_size, latent_dim)
+
+        # Build Decoder
+        modules = []
+
+        self.decoder_input = nn.Linear(latent_dim, conv_out_size)
+
+        hidden_dims.reverse()
+
+        for i in range(len(hidden_dims) - 1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(
+                        hidden_dims[i],
+                        hidden_dims[i + 1],
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        output_padding=1,
+                    ),
+                    nn.BatchNorm2d(hidden_dims[i + 1]),
+                    nn.LeakyReLU(),
+                )
+            )
+
+        self.decoder = nn.Sequential(*modules)
+
+        self.final_layer = nn.Sequential(
+            nn.ConvTranspose2d(
+                hidden_dims[-1],
+                hidden_dims[-1],
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+            ),
+            nn.BatchNorm2d(hidden_dims[-1]),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Maps the given latent codes
+        onto the image space.
+        :param z: (Tensor) [B x D]
+        :return: (Tensor) [B x C x H x W]
+        """
+        result = self.decoder_input(z)
+        result = result.view(-1, *self.conv_out_shape)
+        result = self.decoder(result)
+        result = self.final_layer(result)
+        return result
 
 
 class DiffusionMLP(nn.Module):
@@ -685,14 +797,26 @@ def sample_pieter(
 
 
 if __name__ == "__main__":
-    path = "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
+    path = (
+        "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
+    )
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
+    N, C, H, W = full_dataset.shape
     # Make the state normalizer.
     max_state = dataset.replay_buffer["state"].max(axis=0)
     # min_state = np.zeros_like(max_state)
     min_state = dataset.replay_buffer["state"].min(axis=0)
+
+    # Load VAE.
+    vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+    latent_dim = 32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae_model = VanillaVAE(
+        in_channels=3, in_height=H, in_width=W, latent_dim=latent_dim
+    ).to(device)
+    vae_model.load_state_dict(torch.load(vae_model_path))
 
     # Make train and val loaders
     val_mask = get_val_mask(dataset.replay_buffer.n_episodes, 0.1)
@@ -718,10 +842,20 @@ if __name__ == "__main__":
     state_normalizer = functools.partial(
         normalize_pn1, min_val=min_state, max_val=max_state
     )
-    process_fns = {"state": state_normalizer}
-    # process_fns = {"state": get_normalized_T_xy}
 
-    include_keys = ["state"]
+    def get_latent(x, vae_model, device):
+        x = x / 255.0
+        x = 2 * x - 1
+        return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
+
+    normalize_encoder_input = functools.partial(
+        get_latent, vae_model=vae_model, device=device
+    )
+
+    # process_fns = {"state": state_normalizer, "img": normalize_encoder_input}
+    process_fns = {"img": normalize_encoder_input}
+
+    include_keys = ["img"]
 
     train_episode_dataset = EpisodeDataset(
         dataset,
@@ -748,7 +882,8 @@ if __name__ == "__main__":
         val_episode_dataset, batch_size=batch_size, shuffle=False
     )
 
-    STATE_DIM = 5
+    # Set to latent_dim if diffusing in the VAE latent space and to 5 if diffusing in the state space.
+    STATE_DIM = latent_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # input_dim + 1 because the time step is concatenated to the state.
@@ -770,14 +905,15 @@ if __name__ == "__main__":
         device=device,
     )
 
+    obs_key = "img"
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    name = f"pusht_1dconv_128_256_512_1024/{timestamp}"
+    name = f"pusht_1dconv_latent_128_256_512_1024/{timestamp}"
     save_dir = f"models/diffusion/{name}"
     os.makedirs(save_dir)
-    wandb_run = wandb.init(project='state_1dconv', name=name, reinit=True)
     wandb_run = None
+    # wandb_run = wandb.init(project="state_1dconv_latent", name=name, reinit=True)
     train_losses, test_losses = diffusion.train(
-        wandb_run=wandb_run, save_freq=30, save_dir=save_dir
+        wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
     )
 
     return_steps = [512]
@@ -805,11 +941,11 @@ if __name__ == "__main__":
     )
 
     # Plot samples histogram.
-    n_data, state_dim = dataset.replay_buffer["state"].shape
+    n_data, state_dim = dataset.replay_buffer[obs_key].shape
     plot_samples(
         in_range_samples,
         np.broadcast_to(
-            dataset.replay_buffer["state"][:, None], [n_data, n_obs_history, state_dim]
+            dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
         ),
         save_dir=save_dir,
     )
@@ -817,7 +953,7 @@ if __name__ == "__main__":
     diff_states = []
     for obs_history, pred_horizon in train_loader:
         norm_state = (
-            obs_history["state"].detach().cpu().numpy()
+            obs_history[obs_key].detach().cpu().numpy()
         )  # [batch_size, n_history, dim]
         state = denormalize_pn1(
             norm_state, min_state, max_state
