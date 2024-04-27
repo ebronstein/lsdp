@@ -1,23 +1,25 @@
 from typing import Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from einops import rearrange, reduce
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
-from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
+from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
+
 
 class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
-    def __init__(self, 
+    def __init__(self,
             model: ConditionalUnet1D,
             noise_scheduler: DDPMScheduler,
-            horizon, 
-            obs_dim, 
-            action_dim, 
-            n_action_steps, 
+            horizon,
+            obs_dim,
+            action_dim,
+            n_action_steps,
             n_obs_steps,
             num_inference_steps=None,
             obs_as_local_cond=False,
@@ -28,6 +30,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             **kwargs):
         super().__init__()
         assert not (obs_as_local_cond and obs_as_global_cond)
+        # If we are only predicting the action steps, we must have obs_as_global_cond.
         if pred_action_steps_only:
             assert obs_as_global_cond
         self.model = model
@@ -54,9 +57,11 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
-    
+
+        breakpoint()
+
     # ========= inference  ============
-    def conditional_sample(self, 
+    def conditional_sample(self,
             condition_data, condition_mask,
             local_cond=None, global_cond=None,
             generator=None,
@@ -67,11 +72,11 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         scheduler = self.noise_scheduler
 
         trajectory = torch.randn(
-            size=condition_data.shape, 
+            size=condition_data.shape,
             dtype=condition_data.dtype,
             device=condition_data.device,
             generator=generator)
-    
+
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
@@ -80,18 +85,18 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, 
+            model_output = model(trajectory, t,
                 local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
-                model_output, t, trajectory, 
+                model_output, t, trajectory,
                 generator=generator,
                 **kwargs
                 ).prev_sample
-        
+
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        trajectory[condition_mask] = condition_data[condition_mask]
 
         return trajectory
 
@@ -144,12 +149,12 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
-        
+
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
@@ -163,7 +168,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 start = To - 1
             end = start + self.n_action_steps
             action = action_pred[:,start:end]
-        
+
         result = {
             'action': action,
             'action_pred': action_pred
@@ -181,6 +186,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
     def compute_loss(self, batch):
+        breakpoint()
         # normalize input
         assert 'valid_mask' not in batch
         nbatch = self.normalizer.normalize(batch)
@@ -196,6 +202,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             local_cond = obs
             local_cond[:,self.n_obs_steps:,:] = 0
         elif self.obs_as_global_cond:
+            # Take the first n_obs_steps observations and concatenate them
+            # along the time dimension.
             global_cond = obs[:,:self.n_obs_steps,:].reshape(
                 obs.shape[0], -1)
             if self.pred_action_steps_only:
@@ -204,14 +212,21 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 if self.oa_step_convention:
                     start = To - 1
                 end = start + self.n_action_steps
+                # Only add noise to the first n_action_steps of the action.
                 trajectory = action[:,start:end]
         else:
             trajectory = torch.cat([action, obs], dim=-1)
 
         # generate impainting mask
         if self.pred_action_steps_only:
+            # No conditioning mask needed because trajectory is just the first
+            # n_action_steps of the action, and we are using obs_as_global_cond.
             condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
         else:
+            # If obs_as_local_cond or obs_as_global_cond is True, we don't need
+            # a conditioning mask, so this is all zeros. This is because we only
+            # add noise to the action. This is implemented by constructing the
+            # mask generator with obs_dim=0.
             condition_mask = self.mask_generator(trajectory.shape)
 
         # Sample noise that we'll add to the images
@@ -219,25 +234,27 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         bsz = trajectory.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps, 
+            0, self.noise_scheduler.config.num_train_timesteps,
             (bsz,), device=trajectory.device
         ).long()
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_trajectory = self.noise_scheduler.add_noise(
             trajectory, noise, timesteps)
-        
+
         # compute loss mask
         loss_mask = ~condition_mask
 
-        # apply conditioning
+        # apply conditioning by removing noise from the denoised trajectory and
+        # replacing it with the clean (original) trajectory.
+        # If condition_mask is all zeros, noisy_trajectory is unchanged.
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
-        
+
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, 
+        pred = self.model(noisy_trajectory, timesteps,
             local_cond=local_cond, global_cond=global_cond)
 
-        pred_type = self.noise_scheduler.config.prediction_type 
+        pred_type = self.noise_scheduler.config.prediction_type
         if pred_type == 'epsilon':
             target = noise
         elif pred_type == 'sample':
