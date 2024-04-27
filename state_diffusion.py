@@ -419,8 +419,8 @@ class Diffusion(object):
         def model_with_labels(x, labels, t, **kwargs):
             return self.model(x, labels, t, **kwargs)
 
-        def model_without_labels(x, labels, t):
-            return self.model(x, t)
+        def model_without_labels(x, labels, t, **kwargs):
+            return self.model(x, t, **kwargs)
 
         if has_labels:
             self.model_fn = model_with_labels
@@ -469,7 +469,7 @@ class Diffusion(object):
     def get_sigma(self, t):
         return torch.sin(np.pi / 2 * t).to(self.device)
 
-    def compute_loss(self, x, labels=None):
+    def compute_loss(self, x, obs, labels=None):
         batch_size = x.shape[0]
 
         # Step 1: Sample diffusion timestep uniformly in [0, 1]
@@ -491,8 +491,11 @@ class Diffusion(object):
         # print("epsilon:", epsilon.shape)
         x_t = alpha_t * x + sigma_t * epsilon  # x.shape
 
+        # Flatten obs
+        obs = obs.flatten(1)
+
         # Step 4: Estimate epsilon
-        eps_hat = self.model_fn(x_t, labels, t)
+        eps_hat = self.model_fn(x_t, labels, t, global_cond=obs)
         # print("eps_hat:", eps_hat.shape)
 
         # Step 5: Optimize the loss
@@ -512,9 +515,10 @@ class Diffusion(object):
                     labels = None
                 obs_history, pred_horizon = x
                 obs = obs_history[obs_key].to(self.device)
+                pred = pred_horizon[obs_key].to(self.device)
                 obs = self.obs_normalizer(obs)
 
-                loss = self.compute_loss(obs, labels)
+                loss = self.compute_loss(pred, obs, labels)
                 total_loss += loss.item() * obs.shape[0]
 
         return total_loss / len(test_loader.dataset)
@@ -562,9 +566,10 @@ class Diffusion(object):
                 # print("obs:", obs.shape)
                 obs = self.obs_normalizer(obs)
                 # print("obs:", obs.shape)
+                pred = pred_horizon[obs_key].to(self.device)
 
                 self.optimizer.zero_grad()
-                loss = self.compute_loss(obs, labels)
+                loss = self.compute_loss(pred, obs, labels)
                 loss.backward()
 
                 # Compute the norm of gradients
@@ -715,7 +720,6 @@ def sample(
                     # assert not torch.isnan(eps_hat).any(), f"step: [{i}/{num_steps}], t: {t}"
                     if torch.isnan(eps_hat).any():
                         print("nan eps_hat step = ", i)
-                        breakpoint()
                     if cfg_w is not None:
                         eps_hat_null = model.model_fn(
                             x, null_class, t.expand(num_samples), **model_kwargs
@@ -796,7 +800,7 @@ def sample_pieter(
     return x
 
 
-if __name__ == "__main__":
+def train_diffusion_vae_latent():
     path = (
         "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
@@ -966,3 +970,148 @@ if __name__ == "__main__":
     )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
 
     plot_samples(diff_samples, diff_states, save_dir=save_dir)
+
+
+def train_diffusion_state():
+    print("Loading dataset.")
+    path = (
+        "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
+    )
+
+    dataset = PushTImageDataset(path)
+    full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
+    # Make the state normalizer.
+    max_state = dataset.replay_buffer["state"].max(axis=0)
+    # min_state = np.zeros_like(max_state)
+    min_state = dataset.replay_buffer["state"].min(axis=0)
+
+    # Make train and val loaders
+    val_mask = get_val_mask(dataset.replay_buffer.n_episodes, 0.1)
+    val_idxs = np.where(val_mask)[0]
+    train_idxs = np.where(~val_mask)[0]
+
+    # Make the episode dataset and create a DataLoader.
+    batch_size = 256
+    n_obs_history = 8
+    n_pred_horizon = 8
+
+    state_normalizer = functools.partial(
+        normalize_pn1, min_val=min_state, max_val=max_state
+    )
+
+    process_fns = {"state": state_normalizer}
+    include_keys = ["state"]
+
+    print("Making datasets and dataloaders.")
+    train_episode_dataset = EpisodeDataset(
+        dataset,
+        n_obs_history=n_obs_history,
+        n_pred_horizon=n_pred_horizon,
+        episode_idxs=train_idxs,
+        include_keys=include_keys,
+        process_fns=process_fns,
+        device="cuda",
+    )
+    val_episode_dataset = EpisodeDataset(
+        dataset,
+        n_obs_history=n_obs_history,
+        n_pred_horizon=n_pred_horizon,
+        episode_idxs=val_idxs,
+        include_keys=include_keys,
+        process_fns=process_fns,
+        device="cuda",
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_episode_dataset, batch_size=batch_size, shuffle=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_episode_dataset, batch_size=batch_size, shuffle=False
+    )
+
+    # Set to latent_dim if diffusing in the VAE latent space and to 5 if diffusing in the state space.
+    STATE_DIM = 5
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    global_cond_dim = STATE_DIM * n_obs_history
+    diff_model = conditional_unet1d.ConditionalUnet1D(
+        input_dim=STATE_DIM, down_dims=[128, 256, 512, 1024], global_cond_dim=global_cond_dim
+    ).to(device)
+
+    optim_kwargs = dict(lr=3e-4)
+    diffusion = Diffusion(
+        train_data=train_loader,
+        test_data=val_loader,
+        model=diff_model,
+        n_epochs=200,
+        optim_kwargs=optim_kwargs,
+        device=device,
+    )
+
+    # Save directory.
+    # save_dir = None
+    name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
+    save_dir = f"models/diffusion/{name}"
+    os.makedirs(save_dir)
+
+    wandb_run = None
+    # wandb_run = wandb.init(project="state_1dconv_latent", name=name, reinit=True)
+
+    obs_key = "state"
+    train_losses, test_losses = diffusion.train(
+        wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
+    )
+
+    # return_steps = [512]
+    # num_samples = 1000
+    # normalized_samples = sample(
+    #     diffusion,
+    #     num_samples=num_samples,
+    #     return_steps=return_steps,
+    #     data_shape=(n_obs_history, STATE_DIM),
+    #     clip=None,
+    #     clip_noise=(-3, 3),
+    #     device=device,
+    # )
+
+    # in_range_normalized_samples = []
+    # for num_steps in range(normalized_samples.shape[0]):
+    #     mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
+    #         axis=(-2, -1)
+    #     )
+    #     in_range_normalized_samples.append(normalized_samples[mask])
+
+    # # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
+    # in_range_samples = np.array(
+    #     [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
+    # )
+
+    # # Plot samples histogram.
+    # n_data, state_dim = dataset.replay_buffer[obs_key].shape
+    # plot_samples(
+    #     in_range_samples,
+    #     np.broadcast_to(
+    #         dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
+    #     ),
+    #     save_dir=save_dir,
+    # )
+
+    # diff_states = []
+    # for obs_history, pred_horizon in train_loader:
+    #     norm_state = (
+    #         obs_history[obs_key].detach().cpu().numpy()
+    #     )  # [batch_size, n_history, dim]
+    #     state = denormalize_pn1(
+    #         norm_state, min_state, max_state
+    #     )  # [batch_size, n_history, dim]
+    #     diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
+
+    # diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
+    # diff_samples = np.diff(
+    #     in_range_samples, axis=2
+    # )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+
+    # plot_samples(diff_samples, diff_states, save_dir=save_dir)
+
+
+if __name__ == "__main__":
+    train_diffusion_state()
