@@ -5,6 +5,7 @@ import functools
 import math
 import os
 import sys
+import time
 from typing import Callable, Optional
 
 if "PyTorch_VAE" not in sys.path:
@@ -47,7 +48,7 @@ def plot_losses(train_losses, test_losses, save_dir=None):
         plt.show()
 
 
-def plot_samples(samples, data, save_dir=None):
+def plot_samples(samples, data, return_steps, save_dir=None):
     # Plot histogram of each dimension of the samples
     for i, steps in enumerate(return_steps):
         step_samples = samples[i]  # [num_samples, n_history, dim]
@@ -534,17 +535,13 @@ class Diffusion(object):
     ):
         if wandb_run is not None:
             log_freq = None
-        if save_dir is not None:
-            # Get the current timestamp and save it as a new directory.
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            save_dir = os.path.join(save_dir, timestamp)
-            os.makedirs(save_dir)
 
         train_losses = []
         test_losses = [self.eval(self.test_loader, obs_key=obs_key)]
 
         iter = 0
         for epoch in range(self.n_epochs):
+            epoch_start_time = time.time()
             if wandb_run is not None:
                 wandb_run.log({"epoch": epoch + 1})
             epoch_train_losses = []
@@ -592,12 +589,19 @@ class Diffusion(object):
                 epoch_train_losses.append(loss.item())
 
                 if log_freq is not None and iter % log_freq == 0:
-                    print(f"Epoch {epoch+1}, iter {iter}, Loss: {loss.item()}")
+                    print(f"Epoch {epoch+1}, iter {iter}, Train loss: {loss.item()}")
 
                 iter += 1
 
             train_losses.extend(epoch_train_losses)
-            test_losses.append(self.eval(self.test_loader, obs_key=obs_key))
+            test_loss = self.eval(self.test_loader, obs_key=obs_key)
+            epoch_end_time = time.time()
+            print(f"Epoch {epoch+1}, Test Loss: {test_loss}")
+            test_losses.append(test_loss)
+            print(
+                "Epoch duration:",
+                datetime.timedelta(seconds=epoch_end_time - epoch_start_time),
+            )
 
             if save_dir is not None and epoch % save_freq == 0:
                 self.save(os.path.join(save_dir, f"diffusion_model_epoch_{epoch}.pt"))
@@ -664,11 +668,13 @@ def sample(
     num_samples,
     return_steps,
     data_shape,
+    data_loader: Optional[torch.utils.data.DataLoader] = None,
     labels=None,
     clip=None,
     clip_noise=None,
     cfg_w=None,
     null_class=None,
+    obs_key: str = "state",
     device: str = "cuda",
 ):
     model.model.eval()
@@ -701,6 +707,23 @@ def sample(
             for num_steps in return_steps:
                 ts = np.linspace(1 - 1e-4, 1e-4, num_steps + 1)
 
+                if data_loader is None:
+                    x_shape = (num_samples,) + tuple(data_shape)
+                    obs = None
+                else:
+                    n_obs = 0
+                    obs = []
+                    for obs_history, _ in data_loader:
+                        # [batch_size, n_obs_history, state_dim]
+                        obs_history = obs_history[obs_key]
+                        # Concatenate observations along the time dimension.
+                        obs_history = obs_history.flatten(1)
+                        obs.append(obs_history)
+                        n_obs += obs_history.shape[0]
+                        if n_obs >= num_samples:
+                            break
+                    obs = torch.cat(obs, dim=0)[:num_samples].to(device)
+
                 x = torch.randn(x_shape, device=device)
                 for i in range(num_steps):
                     t = torch.tensor([ts[i]], dtype=torch.float32, device=device)
@@ -715,11 +738,12 @@ def sample(
                     if torch.isnan(x).any():
                         print("nan x at step = ", i)
                     eps_hat = model.model_fn(
-                        x, label, t.expand(num_samples), **model_kwargs
+                        x, label, t.expand(num_samples), global_cond=obs, **model_kwargs
                     )
                     # assert not torch.isnan(eps_hat).any(), f"step: [{i}/{num_steps}], t: {t}"
                     if torch.isnan(eps_hat).any():
                         print("nan eps_hat step = ", i)
+                        breakpoint()
                     if cfg_w is not None:
                         eps_hat_null = model.model_fn(
                             x, null_class, t.expand(num_samples), **model_kwargs
@@ -735,6 +759,7 @@ def sample(
                         sigma_tm1,
                         clip=clip,
                         clip_noise=clip_noise,
+                        device=device,
                     )
 
                 label_samples.append(x.cpu().detach().numpy())
@@ -826,26 +851,11 @@ def train_diffusion_vae_latent():
     val_mask = get_val_mask(dataset.replay_buffer.n_episodes, 0.1)
     val_idxs = np.where(val_mask)[0]
     train_idxs = np.where(~val_mask)[0]
-    # train_idxs = [0]
-    # val_idxs = [1]
 
     # Make the episode dataset and create a DataLoader.
     batch_size = 256
     n_obs_history = 8
-    n_pred_horizon = 0
-
-    def get_normalized_T_xy(state):
-        """Get the normalized x, y coordinates of the T.
-
-        Args:
-            state (np.ndarray): State with shape (n, 5).
-        """
-        xy = state[:, 2:4]
-        return normalize_pn1(xy, min_val=min_state[2:4], max_val=max_state[2:4])
-
-    state_normalizer = functools.partial(
-        normalize_pn1, min_val=min_state, max_val=max_state
-    )
+    n_pred_horizon = 8
 
     def get_latent(x, vae_model, device):
         x = x / 255.0
@@ -861,6 +871,7 @@ def train_diffusion_vae_latent():
 
     include_keys = ["img"]
 
+    print("Making datasets and dataloaders.")
     train_episode_dataset = EpisodeDataset(
         dataset,
         n_obs_history=n_obs_history,
@@ -890,13 +901,12 @@ def train_diffusion_vae_latent():
     STATE_DIM = latent_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # input_dim + 1 because the time step is concatenated to the state.
-    # input_dim = n_obs_history * STATE_DIM + 1
-    # hidden_dims = [256] * 4
-    # diff_model = DiffusionMLP(input_dim, input_dim - 1, hidden_dims).to(device)
-
+    global_cond_dim = STATE_DIM * n_obs_history
     diff_model = conditional_unet1d.ConditionalUnet1D(
-        input_dim=STATE_DIM, down_dims=[128, 256, 512, 1024]
+        input_dim=STATE_DIM,
+        down_dims=[256, 512, 1024],
+        diffusion_step_embed_dim=128,
+        global_cond_dim=global_cond_dim,
     ).to(device)
 
     optim_kwargs = dict(lr=3e-4)
@@ -910,23 +920,41 @@ def train_diffusion_vae_latent():
     )
 
     obs_key = "img"
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    name = f"pusht_1dconv_latent_128_256_512_1024/{timestamp}"
-    save_dir = f"models/diffusion/{name}"
-    os.makedirs(save_dir)
+
     wandb_run = None
     # wandb_run = wandb.init(project="state_1dconv_latent", name=name, reinit=True)
-    train_losses, test_losses = diffusion.train(
-        wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
-    )
+
+    # Load the model.
+    load_dir = None
+    # load_dir = "models/diffusion/pusht-1dconv_state_128_256_512_1024-obs_8-pred_8/2024-04-27_22-07-27"
+    if load_dir is not None:
+        diffusion.load(os.path.join(load_dir, "diffusion_model_final.pt"))
+        train_losses = np.load(os.path.join(load_dir, "train_losses.npy"))
+        test_losses = np.load(os.path.join(load_dir, "test_losses.npy"))
+        save_dir = load_dir
+    else:
+        # Save directory.
+        name = f"pusht-1dconv_latent_128_256_512_1024-obs_8-pred_8"
+        save_dir = f"models/diffusion/{name}"
+        if save_dir is not None:
+            # Get the current timestamp and save it as a new directory.
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            save_dir = os.path.join(save_dir, timestamp)
+            os.makedirs(save_dir)
+
+        train_losses, test_losses = diffusion.train(
+            wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
+        )
 
     return_steps = [512]
     num_samples = 1000
+    print("Sampling.")
     normalized_samples = sample(
         diffusion,
         num_samples=num_samples,
         return_steps=return_steps,
         data_shape=(n_obs_history, STATE_DIM),
+        data_loader=train_loader,
         clip=None,
         clip_noise=(-3, 3),
         device=device,
@@ -943,33 +971,40 @@ def train_diffusion_vae_latent():
     in_range_samples = np.array(
         [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
     )
-
-    # Plot samples histogram.
-    n_data, state_dim = dataset.replay_buffer[obs_key].shape
-    plot_samples(
-        in_range_samples,
-        np.broadcast_to(
-            dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
-        ),
-        save_dir=save_dir,
+    samples = np.array(
+        [denormalize_pn1(s, min_state, max_state) for s in normalized_samples]
     )
 
-    diff_states = []
-    for obs_history, pred_horizon in train_loader:
-        norm_state = (
-            obs_history[obs_key].detach().cpu().numpy()
-        )  # [batch_size, n_history, dim]
-        state = denormalize_pn1(
-            norm_state, min_state, max_state
-        )  # [batch_size, n_history, dim]
-        diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
+    # Save samples.
+    np.save(os.path.join(save_dir, f"train_samples_{num_samples}.npy"), samples)
 
-    diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
-    diff_samples = np.diff(
-        in_range_samples, axis=2
-    )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+    # Plot samples histogram.
+    # n_data, state_dim = dataset.replay_buffer[obs_key].shape
+    # plot_samples(
+    #     in_range_samples,
+    #     np.broadcast_to(
+    #         dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
+    #     ),
+    #     return_steps,
+    #     save_dir=save_dir,
+    # )
 
-    plot_samples(diff_samples, diff_states, save_dir=save_dir)
+    # diff_states = []
+    # for obs_history, pred_horizon in train_loader:
+    #     norm_state = (
+    #         obs_history[obs_key].detach().cpu().numpy()
+    #     )  # [batch_size, n_history, dim]
+    #     state = denormalize_pn1(
+    #         norm_state, min_state, max_state
+    #     )  # [batch_size, n_history, dim]
+    #     diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
+
+    # diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
+    # diff_samples = np.diff(
+    #     in_range_samples, axis=2
+    # )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+
+    # plot_samples(diff_samples, diff_states, return_steps, save_dir=save_dir)
 
 
 def train_diffusion_state():
@@ -1034,7 +1069,9 @@ def train_diffusion_state():
 
     global_cond_dim = STATE_DIM * n_obs_history
     diff_model = conditional_unet1d.ConditionalUnet1D(
-        input_dim=STATE_DIM, down_dims=[128, 256, 512, 1024], global_cond_dim=global_cond_dim
+        input_dim=STATE_DIM,
+        down_dims=[128, 256, 512, 1024],
+        global_cond_dim=global_cond_dim,
     ).to(device)
 
     optim_kwargs = dict(lr=3e-4)
@@ -1047,71 +1084,92 @@ def train_diffusion_state():
         device=device,
     )
 
-    # Save directory.
-    # save_dir = None
-    name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
-    save_dir = f"models/diffusion/{name}"
-    os.makedirs(save_dir)
-
     wandb_run = None
     # wandb_run = wandb.init(project="state_1dconv_latent", name=name, reinit=True)
 
     obs_key = "state"
-    train_losses, test_losses = diffusion.train(
-        wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
+
+    # Load the model.
+    load_dir = "models/diffusion/pusht-1dconv_state_128_256_512_1024-obs_8-pred_8/2024-04-27_22-07-27"
+    if load_dir is not None:
+        diffusion.load(os.path.join(load_dir, "diffusion_model_final.pt"))
+        train_losses = np.load(os.path.join(load_dir, "train_losses.npy"))
+        test_losses = np.load(os.path.join(load_dir, "test_losses.npy"))
+        save_dir = load_dir
+    else:
+        # Save directory.
+        name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
+        save_dir = f"models/diffusion/{name}"
+        if save_dir is not None:
+            # Get the current timestamp and save it as a new directory.
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            save_dir = os.path.join(save_dir, timestamp)
+            os.makedirs(save_dir)
+
+        train_losses, test_losses = diffusion.train(
+            wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
+        )
+
+    return_steps = [512]
+    num_samples = 1000
+    print("Sampling.")
+    normalized_samples = sample(
+        diffusion,
+        num_samples=num_samples,
+        return_steps=return_steps,
+        data_shape=(n_obs_history, STATE_DIM),
+        data_loader=train_loader,
+        clip=None,
+        clip_noise=(-3, 3),
+        device=device,
     )
 
-    # return_steps = [512]
-    # num_samples = 1000
-    # normalized_samples = sample(
-    #     diffusion,
-    #     num_samples=num_samples,
-    #     return_steps=return_steps,
-    #     data_shape=(n_obs_history, STATE_DIM),
-    #     clip=None,
-    #     clip_noise=(-3, 3),
-    #     device=device,
-    # )
+    in_range_normalized_samples = []
+    for num_steps in range(normalized_samples.shape[0]):
+        mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
+            axis=(-2, -1)
+        )
+        in_range_normalized_samples.append(normalized_samples[mask])
 
-    # in_range_normalized_samples = []
-    # for num_steps in range(normalized_samples.shape[0]):
-    #     mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
-    #         axis=(-2, -1)
-    #     )
-    #     in_range_normalized_samples.append(normalized_samples[mask])
+    # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
+    in_range_samples = np.array(
+        [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
+    )
+    samples = np.array(
+        [denormalize_pn1(s, min_state, max_state) for s in normalized_samples]
+    )
 
-    # # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
-    # in_range_samples = np.array(
-    #     [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
-    # )
+    # Save samples.
+    np.save(os.path.join(save_dir, f"train_samples_{num_samples}.npy"), samples)
 
-    # # Plot samples histogram.
-    # n_data, state_dim = dataset.replay_buffer[obs_key].shape
-    # plot_samples(
-    #     in_range_samples,
-    #     np.broadcast_to(
-    #         dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
-    #     ),
-    #     save_dir=save_dir,
-    # )
+    # Plot samples histogram.
+    n_data, state_dim = dataset.replay_buffer[obs_key].shape
+    plot_samples(
+        in_range_samples,
+        np.broadcast_to(
+            dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
+        ),
+        return_steps,
+        save_dir=save_dir,
+    )
 
-    # diff_states = []
-    # for obs_history, pred_horizon in train_loader:
-    #     norm_state = (
-    #         obs_history[obs_key].detach().cpu().numpy()
-    #     )  # [batch_size, n_history, dim]
-    #     state = denormalize_pn1(
-    #         norm_state, min_state, max_state
-    #     )  # [batch_size, n_history, dim]
-    #     diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
+    diff_states = []
+    for obs_history, pred_horizon in train_loader:
+        norm_state = (
+            obs_history[obs_key].detach().cpu().numpy()
+        )  # [batch_size, n_history, dim]
+        state = denormalize_pn1(
+            norm_state, min_state, max_state
+        )  # [batch_size, n_history, dim]
+        diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
 
-    # diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
-    # diff_samples = np.diff(
-    #     in_range_samples, axis=2
-    # )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+    diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
+    diff_samples = np.diff(
+        in_range_samples, axis=2
+    )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
 
-    # plot_samples(diff_samples, diff_states, save_dir=save_dir)
+    plot_samples(diff_samples, diff_states, return_steps, save_dir=save_dir)
 
 
 if __name__ == "__main__":
-    train_diffusion_state()
+    train_diffusion_vae_latent()
