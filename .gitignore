@@ -1,3 +1,6 @@
+*.prof
+PyTorch_VAE
+models/diffusion
 bin
 logs
 wandb
