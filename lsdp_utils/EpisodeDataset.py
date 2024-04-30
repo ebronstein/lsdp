@@ -1,11 +1,17 @@
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Optional, Callable, Tuple
 from tqdm.notebook import tqdm, trange
+from diffusion_policy.common.sampler import get_val_mask
 
 
-def EpisodeDataloaders(dataset, episode_train_idxs, episode_val_idxs,
-                       include_keys, process_fns, cfg) -> Tuple[Dataset, Dataset]:
+def EpisodeDataloaders(dataset, include_keys, process_fns, cfg, val_ratio=0.1) -> Tuple[Dataset, Dataset]:
+
+    # Make train and val loaders
+    val_mask = get_val_mask(dataset.replay_buffer.n_episodes, val_ratio=val_ratio, seed=0)
+    episode_val_idxs = np.where(val_mask)[0]
+    episode_train_idxs = np.where(~val_mask)[0]
 
     train_episode_dataset = EpisodeDataset(
         dataset,
