@@ -20,7 +20,7 @@ from tqdm.notebook import tqdm, trange
 
 import wandb
 from diffusion_policy.common.pytorch_util import compute_conv_output_shape
-from diffusion_policy.common.sampler import get_val_mask
+# from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 from diffusion_policy.model.diffusion import conditional_unet1d
 from ema import EMAHelper
@@ -43,13 +43,16 @@ cfg = SimpleNamespace(dataset_path='/home/matteogu/ssd_data/data_diffusion/pusht
                       # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
                       vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
                       save_dir='/home/matteogu/ssd_data/diffusion_models/models/diffusion/',
-                      batch_size=4096,  # 3.8 Giga for state, better 512 for latents
+                      # batch_size=4096,  # 3.8 Giga for state, better 512 for latents
+
+                      batch_size=64,  # 3.8 Giga for state, better 512 for latents
                       n_obs_history=0,  # if it is 0, it means unconditional generation
-                      n_pred_horizon=8,
-                      down_dims=[256, 512, 1024, 2048],
-                      diffusion_step_embed_dim=128,  # in the original paper was 256
-                      lr=3e-4,  # optimization params
-                      epochs=200,
+                      n_pred_horizon=4,
+                      down_dims=[1024, 2048],  # 512, 1024,
+                      diffusion_step_embed_dim=256,  # in the original paper was 256
+                      lr=1e-3,  # optimization params
+                      epochs=300,
+                      n_warmup_steps=200,
                       device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                       obs_key="img",
                       )
@@ -97,11 +100,6 @@ def train_diffusion():
         cfg.STATE_DIM = 5
         normalize_encoder_input = None
 
-    # Make train and val loaders
-    val_mask = get_val_mask(dataset.replay_buffer.n_episodes, 0.1)
-    val_idxs = np.where(val_mask)[0]
-    train_idxs = np.where(~val_mask)[0]
-
     state_normalizer = functools.partial(
         normalize_pn1, min_val=min_state, max_val=max_state
     )
@@ -110,11 +108,10 @@ def train_diffusion():
 
     print("Making datasets and dataloaders.")
     train_loader, val_loader = EpisodeDataloaders(dataset=dataset,
-                                                  episode_train_idxs=train_idxs,
-                                                  episode_val_idxs=val_idxs,
                                                   include_keys=[cfg.obs_key],  # one key only
                                                   process_fns=process_fns,
-                                                  cfg=cfg)  # configuration params
+                                                  cfg=cfg,
+                                                  val_ratio=0.9)  # configuration params
 
     global_cond_dim = cfg.STATE_DIM * cfg.n_obs_history
 
@@ -134,6 +131,7 @@ def train_diffusion():
         test_data=val_loader,
         model=diff_model,
         n_epochs=cfg.epochs,
+        n_warmup_steps=cfg.n_warmup_steps,
         optim_kwargs=optim_kwargs,
         device=cfg.device,
     )
