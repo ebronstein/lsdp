@@ -42,6 +42,7 @@ from types import SimpleNamespace
 cfg = SimpleNamespace(dataset_path='/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr',
                       # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
                       vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
+                      save_dir='/home/matteogu/ssd_data/diffusion_models/models/diffusion/',
                       batch_size=4096,  # 3.8 Giga for state, better 512 for latents
                       n_obs_history=8,
                       n_pred_horizon=8,
@@ -167,7 +168,7 @@ def train_diffusion():
         # name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
         name = 'pusht'
 
-        save_dir = f"models/diffusion/{name}"
+        save_dir = f"{cfg.save_dir}{name}"
         if save_dir is not None:
             # Get the current timestamp and save it as a new directory.
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
