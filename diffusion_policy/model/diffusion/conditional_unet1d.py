@@ -186,7 +186,7 @@ class ConditionalUnet1D(nn.Module):
 
     def forward(self,
             sample: torch.Tensor,
-            timestep: Union[torch.Tensor, float, int],
+            timestep: Union[torch.Tensor], #, float, int
             local_cond=None, global_cond=None, **kwargs):
         """
         x: (B,T,input_dim)
@@ -206,11 +206,15 @@ class ConditionalUnet1D(nn.Module):
 
         # 1. time
         timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+        ### Our current framework does not need any of this,
+        ### We always pass a tensor, with len(timesteps.shape) == 1
+        # print(timestep.shape, type(timestep), len(timestep.shape),
+        #       not torch.is_tensor(timesteps), torch.is_tensor(timesteps) and len(timesteps.shape) == 0)
+        # if not torch.is_tensor(timesteps):
+        #     # TO DO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+        #     timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        # elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+        #     timesteps = timesteps[None].to(sample.device)
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
 

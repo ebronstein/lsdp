@@ -27,7 +27,7 @@ from ema import EMAHelper
 
 # Custom imports
 from PyTorch_VAE import models
-from lsdp_utils.Diffusion import Diffusion
+from lsdp_utils.Diffusion import Diffusion, DiffusionMLP
 from lsdp_utils.VanillaVAE import VanillaVAE
 from lsdp_utils.EpisodeDataset import EpisodeDataset, EpisodeDataloaders
 from lsdp_utils.utils import plot_losses, plot_samples, normalize_pn1, denormalize_pn1, bcolors
@@ -44,11 +44,11 @@ cfg = SimpleNamespace(dataset_path='/home/matteogu/ssd_data/data_diffusion/pusht
                       vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
                       save_dir='/home/matteogu/ssd_data/diffusion_models/models/diffusion/',
                       batch_size=4096,  # 3.8 Giga for state, better 512 for latents
-                      n_obs_history=8,
+                      n_obs_history=0,  # if it is 0, it means unconditional generation
                       n_pred_horizon=8,
                       down_dims=[256, 512, 1024, 2048],
                       diffusion_step_embed_dim=128,  # in the original paper was 256
-                      lr=3e-5,  # optimization params
+                      lr=3e-4,  # optimization params
                       epochs=200,
                       device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                       obs_key="img",
@@ -125,6 +125,9 @@ def train_diffusion():
         global_cond_dim=global_cond_dim,
     ).to(cfg.device)
 
+    # diff_model = None  # load MLP baseline
+    # diff_model = DiffusionMLP()
+
     optim_kwargs = dict(lr=cfg.lr)
     diffusion = Diffusion(
         train_data=train_loader,
@@ -152,6 +155,8 @@ def train_diffusion():
         # name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
         name = (f'pusht_unet1d_{cfg.obs_key}_{str(cfg.down_dims)[1:-1].replace(", ", "_")}_edim_{cfg.diffusion_step_embed_dim}'
                 f'obs_{cfg.n_obs_history}_pred_{cfg.n_pred_horizon}_bs_{cfg.batch_size}_lr_{cfg.lr}_e_{cfg.epochs}')
+        if diff_model is None:
+            name = 'MLP_Baseline'
 
         save_dir = f"{cfg.save_dir}{name}"
         if save_dir is not None:

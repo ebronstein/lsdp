@@ -43,6 +43,8 @@ def plot_losses(train_losses, test_losses, save_dir=None):
     plt.ylabel("Loss")
     plt.legend()
     plt.grid()
+    plt.title(f"Min train: {np.min(train_losses):.3f} Last train: {train_losses[-1]:.3f} "
+              f"\n Max test: {np.max(test_losses):.3f} Last test: {test_losses[-1]:.3f} ")
     if save_dir is not None:
         plt.savefig(os.path.join(save_dir, "train_test_losses.png"))
     else:
