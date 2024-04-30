@@ -215,6 +215,7 @@ class Diffusion(object):
                 pred = pred_horizon[obs_key].to(self.device)
 
                 self.optimizer.zero_grad()
+                # print(obs.shape, obs)
                 loss = self.compute_loss(pred, obs, labels)
                 loss.backward()
 
@@ -247,8 +248,8 @@ class Diffusion(object):
             train_losses.extend(epoch_train_losses)
             test_loss = self.eval(self.test_loader, obs_key=obs_key)
             epoch_end_time = time.time()
-            print(f"[{datetime.timedelta(seconds=epoch_end_time - epoch_start_time)}]"
-                  f"Epoch {epoch+1}, Test Loss: {test_loss:.4f}")
+            print(f"[{datetime.timedelta(seconds=epoch_end_time - epoch_start_time)}] "
+                  f"Epoch {epoch+1}, iter {iter}, Test Loss: {test_loss:.4f}")
             test_losses.append(test_loss)
 
 

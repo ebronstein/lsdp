@@ -220,7 +220,8 @@ class ConditionalUnet1D(nn.Module):
 
         global_feature = self.diffusion_step_encoder(timesteps)
 
-        if global_cond is not None:
+        if global_cond is not None and global_cond.nelement() > 0:
+            # Do not enter if global_cond is not defined
             # Concatenate the global conditioning to the diffusion timestep.
             global_feature = torch.cat([
                 global_feature, global_cond
