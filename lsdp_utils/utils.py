@@ -1,6 +1,33 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+def normalize_pn1(x, min_val, max_val):
+    # Normalize to [0, 1]
+    nx = (x - min_val) / (max_val - min_val)
+    # Normalize to [-1, 1]
+    return nx * 2 - 1
+
+
+def denormalize_pn1(nx, min_val, max_val):
+    # Denormalize from [-1, 1]
+    x = (nx + 1) / 2
+    # Denormalize from [0, 1]
+    return x * (max_val - min_val) + min_val
+
+
+
 def plot_losses(train_losses, test_losses, save_dir=None):
     # Plot train and test losses.
     plt.figure(figsize=(12, 6))
@@ -15,7 +42,7 @@ def plot_losses(train_losses, test_losses, save_dir=None):
     plt.xlabel("Iterations")
     plt.ylabel("Loss")
     plt.legend()
-
+    plt.grid()
     if save_dir is not None:
         plt.savefig(os.path.join(save_dir, "train_test_losses.png"))
     else:

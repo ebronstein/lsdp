@@ -83,21 +83,22 @@ class EpisodeDataset(Dataset):
                 img = episode["img"].transpose(0, 3, 1, 2)  # CHW format
                 if "img" in self.process_fns:
                     img = self.process_fns["img"](img)
-                obs["img"] = torch.tensor(img, dtype=torch.float32).to(self.device)
+                if type(img) == torch.Tensor:
+                    obs["img"] = img.to(torch.float32).to(self.device)
+                else:
+                    obs["img"] = torch.tensor(img, dtype=torch.float32, device=self.device)
 
             if self.include_keys is None or "action" in self.include_keys:
                 action = episode["action"]
                 if "action" in self.process_fns:
                     action = self.process_fns["action"](action)
-                obs["action"] = torch.tensor(action, dtype=torch.float32).to(
-                    self.device
-                )
+                obs["action"] = torch.tensor(action, dtype=torch.float32, device=self.device)
 
             if self.include_keys is None or "state" in self.include_keys:
                 state = episode["state"]
                 if "state" in self.process_fns:
                     state = self.process_fns["state"](state)
-                obs["state"] = torch.tensor(state, dtype=torch.float32).to(self.device)
+                obs["state"] = torch.tensor(state, dtype=torch.float32, device=self.device)
 
             # Iterate through the episode to create samples with observation history and prediction horizon
             n_obs = len(list(obs.values())[0])

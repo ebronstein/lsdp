@@ -197,6 +197,7 @@ class Diffusion(object):
         test_losses = [self.eval(self.test_loader, obs_key=obs_key)]
 
         iter = 0
+        train_start_time = time.time()
         for epoch in range(self.n_epochs):
             epoch_start_time = time.time()
             if wandb_run is not None:
@@ -254,9 +255,13 @@ class Diffusion(object):
             )
 
             if save_dir is not None and epoch % save_freq == 0:
+                print(f'Saving.. {datetime.timedelta(seconds=time.time() - train_start_time)}')
                 self.save(os.path.join(save_dir, f"diffusion_model_epoch_{epoch}.pt"))
+                np.save(os.path.join(save_dir, "train_losses.npy"), train_losses)
+                np.save(os.path.join(save_dir, "test_losses.npy"), test_losses)
 
         if save_dir is not None:
+            print(f'Saving.. {datetime.timedelta(seconds=time.time() - train_start_time)}')
             self.save(os.path.join(save_dir, "diffusion_model_final.pt"))
             np.save(os.path.join(save_dir, "train_losses.npy"), train_losses)
             np.save(os.path.join(save_dir, "test_losses.npy"), test_losses)

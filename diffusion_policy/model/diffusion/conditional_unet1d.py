@@ -252,7 +252,7 @@ class ConditionalUnet1D(nn.Module):
             # print("x:", x.shape)
             # print("h:", [h_i.shape for h_i in h])
             h_i = h.pop()
-            # print("h_i:", h_i.shape)
+            # print(f"h_i: {h_i.shape}    x: {x.shape}")
             x = torch.cat((x, h_i), dim=1)
             x = resnet(x, global_feature)
             # The correct condition should be:
