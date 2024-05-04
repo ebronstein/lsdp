@@ -11,6 +11,8 @@ from typing import Callable, Optional
 if "PyTorch_VAE" not in sys.path:
     sys.path.append("PyTorch_VAE")
 
+from types import SimpleNamespace
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -20,49 +22,52 @@ from tqdm.notebook import tqdm, trange
 
 import wandb
 from diffusion_policy.common.pytorch_util import compute_conv_output_shape
+
 # from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 from diffusion_policy.model.diffusion import conditional_unet1d
 from ema import EMAHelper
+from lsdp_utils.Diffusion import Diffusion, DiffusionMLP
+from lsdp_utils.EpisodeDataset import EpisodeDataloaders, EpisodeDataset
+from lsdp_utils.utils import (
+    LatentsToStateMLP,
+    bcolors,
+    denormalize_pn1,
+    normalize_pn1,
+    plot_losses,
+    plot_samples,
+)
+from lsdp_utils.VanillaVAE import VanillaVAE
 
 # Custom imports
 from PyTorch_VAE import models
-from lsdp_utils.Diffusion import Diffusion, DiffusionMLP
-from lsdp_utils.VanillaVAE import VanillaVAE
-from lsdp_utils.EpisodeDataset import EpisodeDataset, EpisodeDataloaders
-from lsdp_utils.utils import (plot_losses, plot_samples,
-                              normalize_pn1, denormalize_pn1,
-                              LatentsToStateMLP,
-                              bcolors)
-
-from types import SimpleNamespace
 
 # cfg_latent = SimpleNamespace(batch_size=1024, )
 
 # "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
 # "/home/tsadja/data_diffusion/pusht/pusht_cchi_v7_replay.zarr"
 
-cfg = SimpleNamespace(dataset_path='/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr',
-                      # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
-                      # vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
-                      vae_model_path='/home/matteogu/ssd_data/diffusion_models/models/vae/'
-                                     'pusht_vae_klw_1.00e-07_ldim_128_bs_512_epochs_100_lr_0.0005_hdim_'
-                                     '32_64_128_256_512/vae_99.pt',
-                      save_dir='/home/matteogu/ssd_data/diffusion_models/models/diffusion/',
-                      batch_size=8000,  # 3.8 Giga for state, better 512 for latents
-
-                      # batch_size=64,  # 3.8 Giga for state, better 512 for latents
-                      n_obs_history=0,  # if it is 0, it means unconditional generation
-                      n_pred_horizon=4,
-                      down_dims=[512, 1024],  # 512, 1024, 1024, 2048
-                      diffusion_step_embed_dim=256,  # in the original paper was 256
-                      lr=1e-3,  # optimization params
-                      epochs=300,
-                      n_warmup_steps=200,
-                      device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                      obs_key="img",
-                      latents_to_state=True,
-                      )
+cfg = SimpleNamespace(
+    dataset_path="/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr",
+    # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
+    # vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
+    vae_model_path="/home/matteogu/ssd_data/diffusion_models/models/vae/"
+    "pusht_vae_klw_1.00e-07_ldim_128_bs_512_epochs_100_lr_0.0005_hdim_"
+    "32_64_128_256_512/vae_99.pt",
+    save_dir="/home/matteogu/ssd_data/diffusion_models/models/diffusion/",
+    batch_size=8000,  # 3.8 Giga for state, better 512 for latents
+    # batch_size=64,  # 3.8 Giga for state, better 512 for latents
+    n_obs_history=0,  # if it is 0, it means unconditional generation
+    n_pred_horizon=4,
+    down_dims=[512, 1024],  # 512, 1024, 1024, 2048
+    diffusion_step_embed_dim=256,  # in the original paper was 256
+    lr=1e-3,  # optimization params
+    epochs=300,
+    n_warmup_steps=200,
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    obs_key="img",
+    latents_to_state=True,
+)
 
 assert cfg.obs_key == "img" or cfg.obs_key == "state"
 print(f"{bcolors.OKGREEN}Hyperparamters of the current run:{bcolors.ENDC}")
@@ -91,15 +96,18 @@ def train_diffusion():
         # latent_dim = 32
         latent_dim = 128
         vae_model = VanillaVAE(
-            in_channels=C, in_height=H, in_width=W, latent_dim=latent_dim,
-            hidden_dims=[32, 64, 128, 256, 512]
+            in_channels=C,
+            in_height=H,
+            in_width=W,
+            latent_dim=latent_dim,
+            hidden_dims=[32, 64, 128, 256, 512],
         ).to(cfg.device)
         vae_model.load_state_dict(torch.load(cfg.vae_model_path))
         cfg.STATE_DIM = latent_dim
 
         def get_latent(x, vae_model, device):
             x = x / 255.0
-            x = 2. * x - 1.
+            x = 2.0 * x - 1.0
             return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
 
         normalize_encoder_input = functools.partial(
@@ -108,12 +116,12 @@ def train_diffusion():
 
         if cfg.latents_to_state is not None:
             # these two go together.
-            model_LatentsToStateMLP = LatentsToStateMLP(in_dim=128,
-                                                        out_dim=5,  # state
-                                                        hidden_dims=[256, 256, 128, 16]).to(cfg.device)
-            mlp_path = '/home/matteogu/ssd_data/diffusion_models/models/latent_to_state/mlp_128to5.pt'
+            model_LatentsToStateMLP = LatentsToStateMLP(
+                in_dim=128, out_dim=5, hidden_dims=[256, 256, 128, 16]  # state
+            ).to(cfg.device)
+            mlp_path = "/home/matteogu/ssd_data/diffusion_models/models/latent_to_state/mlp_128to5.pt"
             model_LatentsToStateMLP.load_state_dict(torch.load(mlp_path))
-            cfg.STATE_DIM=5
+            cfg.STATE_DIM = 5
         else:
             model_LatentsToStateMLP = None
     else:
@@ -128,11 +136,13 @@ def train_diffusion():
     process_fns = {"state": state_normalizer, "img": normalize_encoder_input}
 
     print("Making datasets and dataloaders.")
-    train_loader, val_loader = EpisodeDataloaders(dataset=dataset,
-                                                  include_keys=[cfg.obs_key],  # one key only
-                                                  process_fns=process_fns,
-                                                  cfg=cfg,
-                                                  val_ratio=0.9)  # configuration params
+    train_loader, val_loader = EpisodeDataloaders(
+        dataset=dataset,
+        include_keys=[cfg.obs_key],  # one key only
+        process_fns=process_fns,
+        cfg=cfg,
+        val_ratio=0.9,
+    )  # configuration params
 
     global_cond_dim = cfg.STATE_DIM * cfg.n_obs_history
 
@@ -146,7 +156,6 @@ def train_diffusion():
     # diff_model = None  # load MLP baseline
     # diff_model = DiffusionMLP()
 
-
     optim_kwargs = dict(lr=cfg.lr)
     diffusion = Diffusion(
         train_data=train_loader,
@@ -157,7 +166,6 @@ def train_diffusion():
         optim_kwargs=optim_kwargs,
         device=cfg.device,
         mlp_nograd_latents_to_state=model_LatentsToStateMLP,
-
     )
 
     wandb_run = None
@@ -175,10 +183,12 @@ def train_diffusion():
         # Save directory.
         # name = f"pusht-1dconv_latent_128_256_512_1024-obs_8-pred_8"
         # name = f"pusht-1dconv_state_128_256_512_1024-obs_8-pred_8"
-        name = (f'pusht_unet1d_{cfg.obs_key}_{str(cfg.down_dims)[1:-1].replace(", ", "_")}_edim_{cfg.diffusion_step_embed_dim}'
-                f'obs_{cfg.n_obs_history}_pred_{cfg.n_pred_horizon}_bs_{cfg.batch_size}_lr_{cfg.lr}_e_{cfg.epochs}')
+        name = (
+            f'pusht_unet1d_{cfg.obs_key}_{str(cfg.down_dims)[1:-1].replace(", ", "_")}_edim_{cfg.diffusion_step_embed_dim}'
+            f"obs_{cfg.n_obs_history}_pred_{cfg.n_pred_horizon}_bs_{cfg.batch_size}_lr_{cfg.lr}_e_{cfg.epochs}"
+        )
         if diff_model is None:
-            name = 'MLP_Baseline'
+            name = "MLP_Baseline"
 
         save_dir = f"{cfg.save_dir}{name}"
         if save_dir is not None:
@@ -190,132 +200,6 @@ def train_diffusion():
         train_losses, test_losses = diffusion.train(
             wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=cfg.obs_key
         )
-
-
-def train_diffusion_vae_latent():
-
-    return_steps = [512]
-    num_samples = 1000
-    print("Sampling.")
-    normalized_samples = sample(
-        diffusion,
-        num_samples=num_samples,
-        return_steps=return_steps,
-        data_shape=(n_obs_history, STATE_DIM),
-        data_loader=train_loader,
-        clip=None,
-        clip_noise=(-3, 3),
-        device=device,
-    )
-
-    in_range_normalized_samples = []
-    for num_steps in range(normalized_samples.shape[0]):
-        mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
-            axis=(-2, -1)
-        )
-        in_range_normalized_samples.append(normalized_samples[mask])
-
-    # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
-    in_range_samples = np.array(
-        [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
-    )
-    samples = np.array(
-        [denormalize_pn1(s, min_state, max_state) for s in normalized_samples]
-    )
-
-    # Save samples.
-    np.save(os.path.join(save_dir, f"train_samples_{num_samples}.npy"), samples)
-
-    # Plot samples histogram.
-    # n_data, state_dim = dataset.replay_buffer[obs_key].shape
-    # plot_samples(
-    #     in_range_samples,
-    #     np.broadcast_to(
-    #         dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
-    #     ),
-    #     return_steps,
-    #     save_dir=save_dir,
-    # )
-
-    # diff_states = []
-    # for obs_history, pred_horizon in train_loader:
-    #     norm_state = (
-    #         obs_history[obs_key].detach().cpu().numpy()
-    #     )  # [batch_size, n_history, dim]
-    #     state = denormalize_pn1(
-    #         norm_state, min_state, max_state
-    #     )  # [batch_size, n_history, dim]
-    #     diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
-
-    # diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
-    # diff_samples = np.diff(
-    #     in_range_samples, axis=2
-    # )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
-
-    # plot_samples(diff_samples, diff_states, return_steps, save_dir=save_dir)
-
-
-def train_diffusion_state():
-
-    return_steps = [512]
-    num_samples = 1000
-    print("Sampling.")
-    normalized_samples = sample(
-        diffusion,
-        num_samples=num_samples,
-        return_steps=return_steps,
-        data_shape=(cfg.n_obs_history, cfg.STATE_DIM),
-        data_loader=train_loader,
-        clip=None,
-        clip_noise=(-3, 3),
-        device=cfg.device,
-    )
-
-    in_range_normalized_samples = []
-    for num_steps in range(normalized_samples.shape[0]):
-        mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
-            axis=(-2, -1)
-        )
-        in_range_normalized_samples.append(normalized_samples[mask])
-
-    # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
-    in_range_samples = np.array(
-        [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
-    )
-    samples = np.array(
-        [denormalize_pn1(s, min_state, max_state) for s in normalized_samples]
-    )
-
-    # Save samples.
-    np.save(os.path.join(save_dir, f"train_samples_{num_samples}.npy"), samples)
-
-    # Plot samples histogram.
-    n_data, state_dim = dataset.replay_buffer[obs_key].shape
-    plot_samples(
-        in_range_samples,
-        np.broadcast_to(
-            dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
-        ),
-        return_steps,
-        save_dir=save_dir,
-    )
-
-    diff_states = []
-    for obs_history, pred_horizon in train_loader:
-        norm_state = (
-            obs_history[obs_key].detach().cpu().numpy()
-        )  # [batch_size, n_history, dim]
-        state = denormalize_pn1(
-            norm_state, min_state, max_state
-        )  # [batch_size, n_history, dim]
-        diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
-
-    diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
-    diff_samples = np.diff(
-        in_range_samples, axis=2
-    )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
-
-    plot_samples(diff_samples, diff_states, return_steps, save_dir=save_dir)
 
 
 if __name__ == "__main__":
