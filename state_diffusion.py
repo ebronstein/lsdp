@@ -26,7 +26,6 @@ from diffusion_policy.common.pytorch_util import compute_conv_output_shape
 # from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 from diffusion_policy.model.diffusion import conditional_unet1d
-from ema import EMAHelper
 from lsdp_utils.Diffusion import Diffusion, DiffusionMLP
 from lsdp_utils.EpisodeDataset import EpisodeDataloaders, EpisodeDataset
 from lsdp_utils.utils import (
@@ -48,25 +47,22 @@ from PyTorch_VAE import models
 # "/home/tsadja/data_diffusion/pusht/pusht_cchi_v7_replay.zarr"
 
 cfg = SimpleNamespace(
-    dataset_path="/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr",
-    # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
-    # vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
-    vae_model_path="/home/matteogu/ssd_data/diffusion_models/models/vae/"
-    "pusht_vae_klw_1.00e-07_ldim_128_bs_512_epochs_100_lr_0.0005_hdim_"
-    "32_64_128_256_512/vae_99.pt",
-    save_dir="/home/matteogu/ssd_data/diffusion_models/models/diffusion/",
-    batch_size=8000,  # 3.8 Giga for state, better 512 for latents
-    # batch_size=64,  # 3.8 Giga for state, better 512 for latents
+    # dataset_path="/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr",
+    dataset_path="/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr",
+    vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
+    save_dir="models/diffusion/use_ema_helper/",
+    batch_size=256,  # 3.8 Giga for state, better 512 for latents
     n_obs_history=0,  # if it is 0, it means unconditional generation
-    n_pred_horizon=4,
-    down_dims=[512, 1024],  # 512, 1024, 1024, 2048
+    n_pred_horizon=8,
+    down_dims=[128, 256, 512, 1024],
     diffusion_step_embed_dim=256,  # in the original paper was 256
     lr=1e-3,  # optimization params
-    epochs=300,
-    n_warmup_steps=200,
+    epochs=200,
+    n_warmup_steps=100,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     obs_key="img",
-    latents_to_state=True,
+    latents_to_state=False,
+    use_ema_helper=True,
 )
 
 assert cfg.obs_key == "img" or cfg.obs_key == "state"
@@ -93,8 +89,7 @@ def train_diffusion():
 
     if cfg.obs_key == "img":
         # Load VAE.
-        # latent_dim = 32
-        latent_dim = 128
+        latent_dim = 32
         vae_model = VanillaVAE(
             in_channels=C,
             in_height=H,
@@ -114,7 +109,7 @@ def train_diffusion():
             get_latent, vae_model=vae_model, device=cfg.device
         )
 
-        if cfg.latents_to_state is not None:
+        if cfg.latents_to_state:
             # these two go together.
             model_LatentsToStateMLP = LatentsToStateMLP(
                 in_dim=128, out_dim=5, hidden_dims=[256, 256, 128, 16]  # state
@@ -166,6 +161,7 @@ def train_diffusion():
         optim_kwargs=optim_kwargs,
         device=cfg.device,
         mlp_nograd_latents_to_state=model_LatentsToStateMLP,
+        use_ema_helper=cfg.use_ema_helper,
     )
 
     wandb_run = None
