@@ -141,3 +141,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# PyTorch
+*.pt
+
+# Slurm
+slurm*
