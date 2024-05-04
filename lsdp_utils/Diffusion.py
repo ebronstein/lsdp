@@ -22,6 +22,7 @@ class Diffusion(object):
         optim_kwargs: dict = None,
         device: str = "cuda",
         use_ema_helper=False,
+        mlp_nograd_latents_to_state=None,
     ):
         if has_labels:
             raise NotImplementedError()
@@ -29,6 +30,11 @@ class Diffusion(object):
         self.n_epochs = n_epochs
         self.has_labels = has_labels
         self.device = device
+        self.mlp_nograd_latents_to_state = mlp_nograd_latents_to_state
+        # Freeze the model
+        if mlp_nograd_latents_to_state is not None:
+            for param in self.mlp_nograd_latents_to_state.parameters():
+                param.requires_grad = False
 
         self.obs_normalizer = (
             obs_normalizer if obs_normalizer is not None else lambda x: x
@@ -165,6 +171,10 @@ class Diffusion(object):
                 pred = pred_horizon[obs_key].to(self.device)
                 obs = self.obs_normalizer(obs)
 
+                # print(pred.shape)
+                if self.mlp_nograd_latents_to_state is not None:
+                    pred = self.mlp_nograd_latents_to_state(pred)
+                # print(pred.shape)
                 loss = self.compute_loss(pred, obs, labels)
                 total_loss += loss.item() * obs.shape[0]
 
@@ -216,6 +226,10 @@ class Diffusion(object):
 
                 self.optimizer.zero_grad()
                 # print(obs.shape, obs)
+
+                if self.mlp_nograd_latents_to_state is not None:
+                    pred = self.mlp_nograd_latents_to_state(pred)
+
                 loss = self.compute_loss(pred, obs, labels)
                 loss.backward()
 
@@ -249,7 +263,7 @@ class Diffusion(object):
             test_loss = self.eval(self.test_loader, obs_key=obs_key)
             epoch_end_time = time.time()
             print(f"[{datetime.timedelta(seconds=epoch_end_time - epoch_start_time)}] "
-                  f"Epoch {epoch+1}, iter {iter}, Test Loss: {test_loss:.4f}")
+                  f"Epoch {epoch+1}, iter {iter}, Train Loss:{test_loss:.4f} Test Loss: {test_loss:.4f}")
             test_losses.append(test_loss)
 
 

@@ -30,7 +30,10 @@ from PyTorch_VAE import models
 from lsdp_utils.Diffusion import Diffusion, DiffusionMLP
 from lsdp_utils.VanillaVAE import VanillaVAE
 from lsdp_utils.EpisodeDataset import EpisodeDataset, EpisodeDataloaders
-from lsdp_utils.utils import plot_losses, plot_samples, normalize_pn1, denormalize_pn1, bcolors
+from lsdp_utils.utils import (plot_losses, plot_samples,
+                              normalize_pn1, denormalize_pn1,
+                              LatentsToStateMLP,
+                              bcolors)
 
 from types import SimpleNamespace
 
@@ -41,20 +44,24 @@ from types import SimpleNamespace
 
 cfg = SimpleNamespace(dataset_path='/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr',
                       # vae_model_path='/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt',
-                      vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
+                      # vae_model_path='/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt',
+                      vae_model_path='/home/matteogu/ssd_data/diffusion_models/models/vae/'
+                                     'pusht_vae_klw_1.00e-07_ldim_128_bs_512_epochs_100_lr_0.0005_hdim_'
+                                     '32_64_128_256_512/vae_99.pt',
                       save_dir='/home/matteogu/ssd_data/diffusion_models/models/diffusion/',
-                      # batch_size=4096,  # 3.8 Giga for state, better 512 for latents
+                      batch_size=8000,  # 3.8 Giga for state, better 512 for latents
 
-                      batch_size=64,  # 3.8 Giga for state, better 512 for latents
+                      # batch_size=64,  # 3.8 Giga for state, better 512 for latents
                       n_obs_history=0,  # if it is 0, it means unconditional generation
                       n_pred_horizon=4,
-                      down_dims=[1024, 2048],  # 512, 1024,
+                      down_dims=[512, 1024],  # 512, 1024, 1024, 2048
                       diffusion_step_embed_dim=256,  # in the original paper was 256
                       lr=1e-3,  # optimization params
                       epochs=300,
                       n_warmup_steps=200,
                       device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                       obs_key="img",
+                      latents_to_state=True,
                       )
 
 assert cfg.obs_key == "img" or cfg.obs_key == "state"
@@ -81,24 +88,38 @@ def train_diffusion():
 
     if cfg.obs_key == "img":
         # Load VAE.
-        latent_dim = 32
+        # latent_dim = 32
+        latent_dim = 128
         vae_model = VanillaVAE(
-            in_channels=3, in_height=H, in_width=W, latent_dim=latent_dim
+            in_channels=C, in_height=H, in_width=W, latent_dim=latent_dim,
+            hidden_dims=[32, 64, 128, 256, 512]
         ).to(cfg.device)
         vae_model.load_state_dict(torch.load(cfg.vae_model_path))
         cfg.STATE_DIM = latent_dim
 
         def get_latent(x, vae_model, device):
             x = x / 255.0
-            x = 2 * x - 1
+            x = 2. * x - 1.
             return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
 
         normalize_encoder_input = functools.partial(
             get_latent, vae_model=vae_model, device=cfg.device
         )
+
+        if cfg.latents_to_state is not None:
+            # these two go together.
+            model_LatentsToStateMLP = LatentsToStateMLP(in_dim=128,
+                                                        out_dim=5,  # state
+                                                        hidden_dims=[256, 256, 128, 16]).to(cfg.device)
+            mlp_path = '/home/matteogu/ssd_data/diffusion_models/models/latent_to_state/mlp_128to5.pt'
+            model_LatentsToStateMLP.load_state_dict(torch.load(mlp_path))
+            cfg.STATE_DIM=5
+        else:
+            model_LatentsToStateMLP = None
     else:
         cfg.STATE_DIM = 5
         normalize_encoder_input = None
+        model_LatentsToStateMLP = None
 
     state_normalizer = functools.partial(
         normalize_pn1, min_val=min_state, max_val=max_state
@@ -125,6 +146,7 @@ def train_diffusion():
     # diff_model = None  # load MLP baseline
     # diff_model = DiffusionMLP()
 
+
     optim_kwargs = dict(lr=cfg.lr)
     diffusion = Diffusion(
         train_data=train_loader,
@@ -134,6 +156,8 @@ def train_diffusion():
         n_warmup_steps=cfg.n_warmup_steps,
         optim_kwargs=optim_kwargs,
         device=cfg.device,
+        mlp_nograd_latents_to_state=model_LatentsToStateMLP,
+
     )
 
     wandb_run = None

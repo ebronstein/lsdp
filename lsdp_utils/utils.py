@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 
 class bcolors:
     HEADER = '\033[95m'
@@ -43,8 +45,8 @@ def plot_losses(train_losses, test_losses, save_dir=None):
     plt.ylabel("Loss")
     plt.legend()
     plt.grid()
-    plt.title(f"Min train: {np.min(train_losses):.3f} Last train: {train_losses[-1]:.3f} "
-              f"\n Min test: {np.min(test_losses):.3f} Last test: {test_losses[-1]:.3f} ")
+    plt.title(f"Min train: {np.min(train_losses):.2e} Last train: {train_losses[-1]:.2e} "
+              f"\n Min test: {np.min(test_losses):.2e} Last test: {test_losses[-1]:.2e} ")
     if save_dir is not None:
         plt.savefig(os.path.join(save_dir, "train_test_losses.png"))
     else:
@@ -86,3 +88,24 @@ def plot_samples(samples, data, return_steps, save_dir=None):
             plt.savefig(os.path.join(save_dir, f"histogram_{steps}.png"))
         else:
             plt.show()
+
+
+class LatentsToStateMLP(nn.Module):
+    def __init__(
+            self, in_dim, out_dim, hidden_dims: list[int]
+    ):
+        super().__init__()
+
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, out_dim))
+        # layers.append(nn.Tanh())
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x = obs_history.flatten(start_dim=1)
+        x = self.model(x)
+        return x
