@@ -886,6 +886,7 @@ def train_diffusion():
         "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
     root_save_dir = "models/diffusion/"
+    load_dir = "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_0_bs_256_lr_0.001_e_250_ema_norm_latent_standard_normal/2024-05-05_23-17-16"
     save_freq = 30
     # Options: "standard_normal", "uniform", False
     normalize_latent = "standard_normal"
@@ -1024,28 +1025,27 @@ def train_diffusion():
         use_ema_helper=use_ema_helper,
     )
 
-    if root_save_dir is not None:
-        ema_tag = "_ema" if use_ema_helper else ""
-        name = (
-            f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
-            f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}_norm_latent_{normalize_latent}"
-        )
-        save_dir = os.path.join(root_save_dir, name)
-        # Get the current timestamp and save it as a new directory.
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        save_dir = os.path.join(save_dir, timestamp)
-        os.makedirs(save_dir)
-        print(f"Saving to {save_dir}")
-    else:
-        save_dir = None
-
     # Train or load.
-    load_dir = None
     if load_dir is not None:
+        save_dir = load_dir
         diffusion.load(os.path.join(load_dir, "diffusion_model_final.pt"))
         train_losses = np.load(os.path.join(load_dir, "train_losses.npy"))
         test_losses = np.load(os.path.join(load_dir, "test_losses.npy"))
     else:
+        if root_save_dir is not None:
+            ema_tag = "_ema" if use_ema_helper else ""
+            name = (
+                f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
+                f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}_norm_latent_{normalize_latent}"
+            )
+            save_dir = os.path.join(root_save_dir, name)
+            # Get the current timestamp and save it as a new directory.
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            save_dir = os.path.join(save_dir, timestamp)
+            os.makedirs(save_dir)
+        else:
+            save_dir = None
+
         train_losses, test_losses = diffusion.train(
             obs_key=obs_key,
             save_freq=save_freq,
@@ -1053,6 +1053,9 @@ def train_diffusion():
             save_dir=save_dir,
             add_timestamp_to_save_dir=False,
         )
+
+    if save_dir is not None:
+        print(f"Saving to {save_dir}")
 
     # Plot losses.
     plot_losses(train_losses, test_losses, save_dir=save_dir)
@@ -1096,13 +1099,16 @@ def train_diffusion():
             else [batch_size, n_pred_horizon]
         )
 
-        # Remove samples that are out of the range [-1, 1].
-        mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
-            axis=(-2, -1)
-        )
-        # mask = np.ones_like(mask, dtype=bool)
-        # Range: [-1, 1] (for real now)
-        in_range_normalized_samples = normalized_samples[mask][None]
+        if normalize_latent == "uniform":
+            # Remove samples that are out of the range [-1, 1].
+            mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
+                axis=(-2, -1)
+            )
+            # mask = np.ones_like(mask, dtype=bool)
+            # Range: [-1, 1] (for real now)
+            in_range_normalized_samples = normalized_samples[mask][None]
+        else:
+            in_range_normalized_samples = normalized_samples
 
         for i in trange(0, num_batches, batch_size):
             # Range: [-1, 1]
