@@ -117,6 +117,60 @@ def denormalize_pn1(nx, min_val, max_val):
     return x * (max_val - min_val) + min_val
 
 
+def normalize_standard_normal(x, mean, std):
+    return (x - mean) / std
+
+
+def denormalize_standard_normal(nx, mean, std):
+    return nx * std + mean
+
+
+# TODO: use this and make it general using an abstract class.
+# class StandardNormalDataNormalizer(nn.Module):
+#     def __init__(self, input_dim, n_obs_history, obs_key: str):
+#         super(StandardNormalDataNormalizer, self).__init__()
+#         self.register_buffer("mean", torch.zeros(input_dim, requires_grad=False))
+#         self.register_buffer("std", torch.ones(input_dim, requires_grad=False))
+#         self.input_dim = input_dim
+#         self.n_obs_history = n_obs_history
+#         self.obs_key = obs_key
+
+#     def forward(self, x):
+#         return (x - self.mean) / self.std
+
+#     def normalize(self, x):
+#         self.forward(x)
+
+#     def denormalize(self, nx):
+#         return nx * self.std + self.mean
+
+#     @torch.no_grad()
+#     def fit(self, data_loader):
+#         data = []
+#         for x in data_loader:
+#             obs_history, pred_horizon = x
+#             obs = obs_history if self.n_obs_history > 0 else pred_horizon
+#             latent = obs[self.obs_key]  # [B, obs_history, latent_dim]
+#             data.append(latent.flatten(0, 1).cpu().numpy())
+#         data = np.concatenate(data, axis=0)
+#         mean = np.mean(data, dim=0)
+#         std = np.std(data, dim=0)
+#         self.mean = nn.Parameter(
+#             torch.tensor(mean, dtype=torch.float32), requires_grad=False
+#         )
+#         self.std = nn.Parameter(
+#             torch.tensor(std, dtype=torch.float32), requires_grad=False
+#         )
+
+#     def save(self, filepath):
+#         torch.save({"mean": self.mean, "std": self.std}, filepath)
+
+#     def load(self, filepath):
+#         state_dict = torch.load(filepath)
+#         self.mean = nn.Parameter(state_dict["mean"], requires_grad=False)
+#         self.std = nn.Parameter(state_dict["std"], requires_grad=False)
+
+
 class EpisodeDataset(Dataset):
     def __init__(
         self,
@@ -555,7 +609,8 @@ class Diffusion(object):
                 # Get the current timestamp and save it as a new directory.
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 save_dir = os.path.join(save_dir, timestamp)
-            os.makedirs(save_dir)
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
 
         train_losses = []
         test_losses = [self.eval(self.test_loader, obs_key=obs_key)]
@@ -824,7 +879,7 @@ def train_diffusion():
     n_obs_history = 8
     n_pred_horizon = 0
     diffusion_step_embed_dim = 256
-    n_epochs = 500
+    n_epochs = 250
     lr = 1e-3
     use_ema_helper = True
     path = (
@@ -832,10 +887,15 @@ def train_diffusion():
     )
     root_save_dir = "models/diffusion/"
     save_freq = 30
+    # Options: "standard_normal", "uniform", False
+    normalize_latent = "standard_normal"
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
     N, C, H, W = full_dataset.shape
+
+    if normalize_latent not in ["standard_normal", "uniform", False]:
+        raise ValueError(f"Invalid value for normalize_latent: {normalize_latent}")
 
     if obs_key == "state":
         STATE_DIM = 5
@@ -906,24 +966,34 @@ def train_diffusion():
     )
 
     # Make the observation normalizer.
-    if obs_key == "img":
-        # Compute the mean and standard deviation of the VAE latents on the training set.
+    if obs_key == "img" and normalize_latent:
         train_latents = []
         for x in train_loader:
             obs_history, pred_horizon = x
             obs = obs_history if n_obs_history > 0 else pred_horizon
             latent = obs[obs_key].to(device)  # [B, obs_history, latent_dim]
             train_latents.append(latent.flatten(0, 1).cpu().numpy())
-
         train_latents = np.concatenate(train_latents, axis=0)
-        latent_min = train_latents.min(axis=0)
-        latent_max = train_latents.max(axis=0)
 
-        obs_normalizer = functools.partial(
-            normalize_pn1,
-            min_val=torch.tensor(latent_min, dtype=torch.float32, device=device),
-            max_val=torch.tensor(latent_max, dtype=torch.float32, device=device),
-        )
+        if normalize_latent == "standard_normal":
+            # Compute the mean and standard deviation of the VAE latents on the training set.
+            latent_mean = train_latents.mean(axis=0)
+            latent_std = train_latents.std(axis=0)
+            obs_normalizer = functools.partial(
+                normalize_standard_normal,
+                mean=torch.tensor(latent_mean, dtype=torch.float32, device=device),
+                std=torch.tensor(latent_std, dtype=torch.float32, device=device),
+            )
+
+        elif normalize_latent == "uniform":
+            latent_min = train_latents.min(axis=0)
+            latent_max = train_latents.max(axis=0)
+
+            obs_normalizer = functools.partial(
+                normalize_pn1,
+                min_val=torch.tensor(latent_min, dtype=torch.float32, device=device),
+                max_val=torch.tensor(latent_max, dtype=torch.float32, device=device),
+            )
     else:
         obs_normalizer = None
 
@@ -958,7 +1028,7 @@ def train_diffusion():
         ema_tag = "_ema" if use_ema_helper else ""
         name = (
             f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
-            f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}"
+            f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}_norm_latent_{normalize_latent}"
         )
         save_dir = os.path.join(root_save_dir, name)
         # Get the current timestamp and save it as a new directory.
@@ -989,8 +1059,12 @@ def train_diffusion():
 
     # Save latent min and max.
     if obs_key == "img":
-        np.save(os.path.join(save_dir, "latent_min.npy"), latent_min)
-        np.save(os.path.join(save_dir, "latent_max.npy"), latent_max)
+        if normalize_latent == "standard_normal":
+            np.save(os.path.join(save_dir, "latent_mean.npy"), latent_mean)
+            np.save(os.path.join(save_dir, "latent_std.npy"), latent_std)
+        elif normalize_latent == "uniform":
+            np.save(os.path.join(save_dir, "latent_min.npy"), latent_min)
+            np.save(os.path.join(save_dir, "latent_max.npy"), latent_max)
 
     # Sample.
     data_shape = (
@@ -1040,10 +1114,20 @@ def train_diffusion():
             )
 
             # Denormalize using the latents statistics.
-            # Range: [latent_min, latent_max]
-            batch_samples = denormalize_pn1(
-                normalized_batch_samples, latent_min, latent_max
-            )
+            if normalize_latent == "standard_normal":
+                # Range: [-1, 1]
+                batch_samples = denormalize_standard_normal(
+                    normalized_batch_samples, latent_mean, latent_std
+                )
+            elif normalize_latent == "uniform":
+                # Range: [latent_min, latent_max]
+                batch_samples = denormalize_pn1(
+                    normalized_batch_samples, latent_min, latent_max
+                )
+            elif not normalize_latent:
+                batch_samples = normalized_batch_samples
+            else:
+                raise ValueError(f"Invalid normalize_latent: {normalize_latent}")
 
             # Decode using the VAE.
             # [batch_size * n_obs_history, C, H, W]
