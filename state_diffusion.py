@@ -47,7 +47,7 @@ def plot_losses(train_losses, test_losses, save_dir=None):
         plt.show()
 
 
-def plot_samples(samples, data, save_dir=None):
+def plot_samples(samples, data, return_steps, save_dir=None):
     # Plot histogram of each dimension of the samples
     for i, steps in enumerate(return_steps):
         step_samples = samples[i]  # [num_samples, n_history, dim]
@@ -82,6 +82,25 @@ def plot_samples(samples, data, save_dir=None):
             plt.savefig(os.path.join(save_dir, f"histogram_{steps}.png"))
         else:
             plt.show()
+
+
+def plot_img_samples(imgs, num_rollouts: int = 10, save_dir=None):
+    # imgs shape: [N, n_obs_history, C, H, W]
+    n_obs_history = imgs.shape[1]
+    fig, axs = plt.subplots(
+        num_rollouts, n_obs_history, figsize=(24, 24), squeeze=False
+    )
+    for i in range(num_rollouts):
+        for j in range(n_obs_history):
+            ax = axs[i, j]
+            ax.imshow(imgs[i, j])
+            ax.axis("off")
+    fig.tight_layout()
+
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "img_samples.png"))
+    else:
+        plt.show()
 
 
 def normalize_pn1(x, min_val, max_val):
@@ -522,18 +541,20 @@ class Diffusion(object):
     def train(
         self,
         log_freq=100,
-        save_freq: int = 10,
+        save_freq: int = 30,
         obs_key: str = "state",
         process_labels_fn=None,
         save_dir=None,
+        add_timestamp_to_save_dir=True,
         wandb_run=None,
     ):
         if wandb_run is not None:
             log_freq = None
         if save_dir is not None:
-            # Get the current timestamp and save it as a new directory.
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            save_dir = os.path.join(save_dir, timestamp)
+            if add_timestamp_to_save_dir:
+                # Get the current timestamp and save it as a new directory.
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                save_dir = os.path.join(save_dir, timestamp)
             os.makedirs(save_dir)
 
         train_losses = []
@@ -715,7 +736,6 @@ def sample(
                     # assert not torch.isnan(eps_hat).any(), f"step: [{i}/{num_steps}], t: {t}"
                     if torch.isnan(eps_hat).any():
                         print("nan eps_hat step = ", i)
-                        breakpoint()
                     if cfg_w is not None:
                         eps_hat_null = model.model_fn(
                             x, null_class, t.expand(num_samples), **model_kwargs
@@ -796,67 +816,70 @@ def sample_pieter(
     return x
 
 
-if __name__ == "__main__":
+def train_diffusion():
+    # TODO: make these into args
+    obs_key = "img"
+    device = "cuda"
+    batch_size = 256
+    n_obs_history = 8
+    n_pred_horizon = 0
+    diffusion_step_embed_dim = 256
+    n_epochs = 500
+    lr = 1e-3
+    use_ema_helper = True
     path = (
         "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
+    root_save_dir = "models/diffusion/"
+    save_freq = 30
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
     N, C, H, W = full_dataset.shape
-    # Make the state normalizer.
-    max_state = dataset.replay_buffer["state"].max(axis=0)
-    # min_state = np.zeros_like(max_state)
-    min_state = dataset.replay_buffer["state"].min(axis=0)
 
-    # Load VAE.
-    vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
-    latent_dim = 32
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vae_model = VanillaVAE(
-        in_channels=3, in_height=H, in_width=W, latent_dim=latent_dim
-    ).to(device)
-    vae_model.load_state_dict(torch.load(vae_model_path))
+    if obs_key == "state":
+        STATE_DIM = 5
+        # Make the state normalizer.
+        max_state = dataset.replay_buffer["state"].max(axis=0)
+        # min_state = np.zeros_like(max_state)
+        min_state = dataset.replay_buffer["state"].min(axis=0)
+
+        state_normalizer = functools.partial(
+            normalize_pn1, min_val=min_state, max_val=max_state
+        )
+        process_fns = {"state": state_normalizer}
+    elif obs_key == "img":
+        STATE_DIM = latent_dim = 32
+
+        # Load VAE.
+        vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+        vae_model = VanillaVAE(
+            in_channels=3,
+            in_height=H,
+            in_width=W,
+            latent_dim=latent_dim,
+            hidden_dims=[32, 64, 128, 256, 512],
+        ).to(device)
+        vae_model.load_state_dict(torch.load(vae_model_path))
+
+        def get_latent(x, vae_model, device):
+            x = x / 255.0
+            x = 2.0 * x - 1.0
+            return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
+
+        normalize_encoder_input = functools.partial(
+            get_latent, vae_model=vae_model, device=device
+        )
+        process_fns = {"img": normalize_encoder_input}
+
+    include_keys = [obs_key]
 
     # Make train and val loaders
     val_mask = get_val_mask(dataset.replay_buffer.n_episodes, 0.1)
     val_idxs = np.where(val_mask)[0]
     train_idxs = np.where(~val_mask)[0]
-    # train_idxs = [0]
-    # val_idxs = [1]
 
     # Make the episode dataset and create a DataLoader.
-    batch_size = 256
-    n_obs_history = 8
-    n_pred_horizon = 0
-
-    def get_normalized_T_xy(state):
-        """Get the normalized x, y coordinates of the T.
-
-        Args:
-            state (np.ndarray): State with shape (n, 5).
-        """
-        xy = state[:, 2:4]
-        return normalize_pn1(xy, min_val=min_state[2:4], max_val=max_state[2:4])
-
-    state_normalizer = functools.partial(
-        normalize_pn1, min_val=min_state, max_val=max_state
-    )
-
-    def get_latent(x, vae_model, device):
-        x = x / 255.0
-        x = 2 * x - 1
-        return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
-
-    normalize_encoder_input = functools.partial(
-        get_latent, vae_model=vae_model, device=device
-    )
-
-    # process_fns = {"state": state_normalizer, "img": normalize_encoder_input}
-    process_fns = {"img": normalize_encoder_input}
-
-    include_keys = ["img"]
-
     train_episode_dataset = EpisodeDataset(
         dataset,
         n_obs_history=n_obs_history,
@@ -864,7 +887,7 @@ if __name__ == "__main__":
         episode_idxs=train_idxs,
         include_keys=include_keys,
         process_fns=process_fns,
-        device="cuda",
+        device=device,
     )
     val_episode_dataset = EpisodeDataset(
         dataset,
@@ -873,7 +896,7 @@ if __name__ == "__main__":
         episode_idxs=val_idxs,
         include_keys=include_keys,
         process_fns=process_fns,
-        device="cuda",
+        device=device,
     )
     train_loader = torch.utils.data.DataLoader(
         train_episode_dataset, batch_size=batch_size, shuffle=True
@@ -882,87 +905,223 @@ if __name__ == "__main__":
         val_episode_dataset, batch_size=batch_size, shuffle=False
     )
 
-    # Set to latent_dim if diffusing in the VAE latent space and to 5 if diffusing in the state space.
-    STATE_DIM = latent_dim
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Make the observation normalizer.
+    if obs_key == "img":
+        # Compute the mean and standard deviation of the VAE latents on the training set.
+        train_latents = []
+        for x in train_loader:
+            obs_history, pred_horizon = x
+            obs = obs_history if n_obs_history > 0 else pred_horizon
+            latent = obs[obs_key].to(device)  # [B, obs_history, latent_dim]
+            train_latents.append(latent.flatten(0, 1).cpu().numpy())
 
-    # input_dim + 1 because the time step is concatenated to the state.
-    # input_dim = n_obs_history * STATE_DIM + 1
-    # hidden_dims = [256] * 4
-    # diff_model = DiffusionMLP(input_dim, input_dim - 1, hidden_dims).to(device)
+        train_latents = np.concatenate(train_latents, axis=0)
+        latent_min = train_latents.min(axis=0)
+        latent_max = train_latents.max(axis=0)
+
+        obs_normalizer = functools.partial(
+            normalize_pn1,
+            min_val=torch.tensor(latent_min, dtype=torch.float32, device=device),
+            max_val=torch.tensor(latent_max, dtype=torch.float32, device=device),
+        )
+    else:
+        obs_normalizer = None
+
+    if n_obs_history == 1:
+        down_dims = [128, 256]
+    elif n_obs_history == 4:
+        down_dims = [128, 256, 512]
+    elif n_obs_history == 8:
+        down_dims = [128, 256, 512, 1024]
+    else:
+        raise NotImplementedError()
 
     diff_model = conditional_unet1d.ConditionalUnet1D(
-        input_dim=STATE_DIM, down_dims=[128, 256, 512, 1024]
+        input_dim=STATE_DIM,
+        down_dims=down_dims,
+        diffusion_step_embed_dim=diffusion_step_embed_dim,
     ).to(device)
 
-    optim_kwargs = dict(lr=3e-4)
+    optim_kwargs = dict(lr=lr)
     diffusion = Diffusion(
         train_data=train_loader,
         test_data=val_loader,
+        obs_normalizer=obs_normalizer,
         model=diff_model,
-        n_epochs=200,
+        n_epochs=n_epochs,
         optim_kwargs=optim_kwargs,
         device=device,
+        use_ema_helper=use_ema_helper,
     )
 
-    obs_key = "img"
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    name = f"pusht_1dconv_latent_128_256_512_1024/{timestamp}"
-    save_dir = f"models/diffusion/{name}"
-    os.makedirs(save_dir)
-    wandb_run = None
-    # wandb_run = wandb.init(project="state_1dconv_latent", name=name, reinit=True)
-    train_losses, test_losses = diffusion.train(
-        wandb_run=wandb_run, save_freq=30, save_dir=save_dir, obs_key=obs_key
-    )
+    if root_save_dir is not None:
+        ema_tag = "_ema" if use_ema_helper else ""
+        name = (
+            f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
+            f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}"
+        )
+        save_dir = os.path.join(root_save_dir, name)
+        # Get the current timestamp and save it as a new directory.
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        save_dir = os.path.join(save_dir, timestamp)
+        os.makedirs(save_dir)
+        print(f"Saving to {save_dir}")
+    else:
+        save_dir = None
 
+    # Train or load.
+    load_dir = None
+    if load_dir is not None:
+        diffusion.load(os.path.join(load_dir, "diffusion_model_final.pt"))
+        train_losses = np.load(os.path.join(load_dir, "train_losses.npy"))
+        test_losses = np.load(os.path.join(load_dir, "test_losses.npy"))
+    else:
+        train_losses, test_losses = diffusion.train(
+            obs_key=obs_key,
+            save_freq=save_freq,
+            wandb_run=None,
+            save_dir=save_dir,
+            add_timestamp_to_save_dir=False,
+        )
+
+    # Plot losses.
+    plot_losses(train_losses, test_losses, save_dir=save_dir)
+
+    # Save latent min and max.
+    if obs_key == "img":
+        np.save(os.path.join(save_dir, "latent_min.npy"), latent_min)
+        np.save(os.path.join(save_dir, "latent_max.npy"), latent_max)
+
+    # Sample.
+    data_shape = (
+        (n_obs_history, STATE_DIM) if n_obs_history > 0 else (n_pred_horizon, STATE_DIM)
+    )
     return_steps = [512]
     num_samples = 1000
     normalized_samples = sample(
         diffusion,
         num_samples=num_samples,
         return_steps=return_steps,
-        data_shape=(n_obs_history, STATE_DIM),
+        data_shape=data_shape,
         clip=None,
         clip_noise=(-3, 3),
         device=device,
     )
 
-    in_range_normalized_samples = []
-    for num_steps in range(normalized_samples.shape[0]):
+    if obs_key == "img":
+        # Decode using VAE.
+        batch_size = 8
+        vae_model.to(device)
+
+        # Decode the samples in batches
+        decoded_normalized_samples = []
+        num_batches = 10  # num_samples // batch_size
+        reshape_batch_shape = (
+            [batch_size, n_obs_history]
+            if n_obs_history != 0
+            else [batch_size, n_pred_horizon]
+        )
+
+        # Remove samples that are out of the range [-1, 1].
         mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
             axis=(-2, -1)
         )
-        in_range_normalized_samples.append(normalized_samples[mask])
+        # mask = np.ones_like(mask, dtype=bool)
+        # Range: [-1, 1] (for real now)
+        in_range_normalized_samples = normalized_samples[mask][None]
 
-    # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
-    in_range_samples = np.array(
-        [denormalize_pn1(s, min_state, max_state) for s in in_range_normalized_samples]
-    )
+        for i in trange(0, num_batches, batch_size):
+            # Range: [-1, 1]
+            normalized_batch_samples = in_range_normalized_samples[
+                0, i : i + batch_size
+            ]  # [batch_size * n_obs_history, latent_dim]
+            normalized_batch_samples = normalized_batch_samples.reshape(
+                (-1, normalized_batch_samples.shape[-1])
+            )
 
-    # Plot samples histogram.
-    n_data, state_dim = dataset.replay_buffer[obs_key].shape
-    plot_samples(
-        in_range_samples,
-        np.broadcast_to(
-            dataset.replay_buffer[obs_key][:, None], [n_data, n_obs_history, state_dim]
-        ),
-        save_dir=save_dir,
-    )
+            # Denormalize using the latents statistics.
+            # Range: [latent_min, latent_max]
+            batch_samples = denormalize_pn1(
+                normalized_batch_samples, latent_min, latent_max
+            )
 
-    diff_states = []
-    for obs_history, pred_horizon in train_loader:
-        norm_state = (
-            obs_history[obs_key].detach().cpu().numpy()
-        )  # [batch_size, n_history, dim]
-        state = denormalize_pn1(
-            norm_state, min_state, max_state
-        )  # [batch_size, n_history, dim]
-        diff_states.append(np.diff(state, axis=1))  # [batch_size, n_history - 1, dim]
+            # Decode using the VAE.
+            # [batch_size * n_obs_history, C, H, W]
+            # Range: [-1, 1]
+            decoded_batch = vae_model.decode(torch.from_numpy(batch_samples).to(device))
+            decoded_batch = decoded_batch.reshape(
+                reshape_batch_shape + list(decoded_batch.shape[1:])
+            )
+            # print("decoded_batch:", decoded_batch.shape)
+            decoded_normalized_samples.append(decoded_batch.cpu().detach().numpy())
 
-    diff_states = np.concatenate(diff_states, axis=0)  # [n_samples, n_history - 1, dim]
-    diff_samples = np.diff(
-        in_range_samples, axis=2
-    )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+        decoded_normalized_samples = np.concatenate(decoded_normalized_samples)
 
-    plot_samples(diff_samples, diff_states, save_dir=save_dir)
+        # Denormalize.
+        view_recons = decoded_normalized_samples.transpose(0, 1, 3, 4, 2)
+        # Range: [0, 1]
+        view_recons = (view_recons + 1) / 2
+        # Range: [0, 255]
+        view_recons *= 255
+        view_recons = view_recons.astype(np.uint8)
+
+        # Save image samples.
+        plot_img_samples(view_recons, save_dir=save_dir)
+
+        # Save image samples as numpy arrays.
+        np.save(os.path.join(save_dir, "img_samples.npy"), view_recons)
+    elif obs_key == "state":
+        # TODO: implement this.
+        in_range_normalized_samples = []
+        for num_steps in range(normalized_samples.shape[0]):
+            mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
+                axis=(-2, -1)
+            )
+            in_range_normalized_samples.append(normalized_samples[mask])
+
+        # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
+        in_range_samples = np.array(
+            [
+                denormalize_pn1(s, min_state, max_state)
+                for s in in_range_normalized_samples
+            ]
+        )
+
+        # Plot samples histogram.
+        n_data, state_dim = dataset.replay_buffer[obs_key].shape
+        plot_samples(
+            in_range_samples,
+            np.broadcast_to(
+                dataset.replay_buffer[obs_key][:, None],
+                [n_data, n_obs_history, state_dim],
+            ),
+            return_steps=return_steps,
+            save_dir=save_dir,
+        )
+
+        diff_states = []
+        for obs_history, pred_horizon in train_loader:
+            norm_state = (
+                obs_history[obs_key].detach().cpu().numpy()
+            )  # [batch_size, n_history, dim]
+            state = denormalize_pn1(
+                norm_state, min_state, max_state
+            )  # [batch_size, n_history, dim]
+            diff_states.append(
+                np.diff(state, axis=1)
+            )  # [batch_size, n_history - 1, dim]
+
+        diff_states = np.concatenate(
+            diff_states, axis=0
+        )  # [n_samples, n_history - 1, dim]
+        diff_samples = np.diff(
+            in_range_samples, axis=2
+        )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
+
+        plot_samples(
+            diff_samples, diff_states, return_steps=return_steps, save_dir=save_dir
+        )
+
+
+if __name__ == "__main__":
+    train_diffusion()
