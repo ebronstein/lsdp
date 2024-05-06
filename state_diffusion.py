@@ -492,8 +492,8 @@ class Diffusion(object):
         def model_with_labels(x, labels, t, **kwargs):
             return self.model(x, labels, t, **kwargs)
 
-        def model_without_labels(x, labels, t):
-            return self.model(x, t)
+        def model_without_labels(x, labels, t, **kwargs):
+            return self.model(x, t, **kwargs)
 
         if has_labels:
             self.model_fn = model_with_labels
@@ -542,7 +542,7 @@ class Diffusion(object):
     def get_sigma(self, t):
         return torch.sin(np.pi / 2 * t).to(self.device)
 
-    def compute_loss(self, x, labels=None):
+    def compute_loss(self, x, obs, labels=None):
         batch_size = x.shape[0]
 
         # Step 1: Sample diffusion timestep uniformly in [0, 1]
@@ -564,8 +564,11 @@ class Diffusion(object):
         # print("epsilon:", epsilon.shape)
         x_t = alpha_t * x + sigma_t * epsilon  # x.shape
 
+        # Flatten obs
+        obs = obs.flatten(1)  # [batch_size, n_history * global_cond_dim]
+
         # Step 4: Estimate epsilon
-        eps_hat = self.model_fn(x_t, labels, t)
+        eps_hat = self.model_fn(x_t, labels, t, global_cond=obs)
         # print("eps_hat:", eps_hat.shape)
 
         # Step 5: Optimize the loss
@@ -585,9 +588,12 @@ class Diffusion(object):
                     labels = None
                 obs_history, pred_horizon = x
                 obs = obs_history[obs_key].to(self.device)
-                obs = self.obs_normalizer(obs)
+                pred = pred_horizon[obs_key].to(self.device)
 
-                loss = self.compute_loss(obs, labels)
+                obs = self.obs_normalizer(obs)
+                pred = self.obs_normalizer(pred)
+
+                loss = self.compute_loss(pred, obs, labels)
                 total_loss += loss.item() * obs.shape[0]
 
         return total_loss / len(test_loader.dataset)
@@ -635,12 +641,16 @@ class Diffusion(object):
 
                 obs_history, pred_horizon = x
                 obs = obs_history[obs_key].to(self.device)
-                # print("obs:", obs.shape)
+                pred = pred_horizon[obs_key].to(self.device)
+
+                # Normalize.
+                # For unconditional generation, obs is empty, so calling
+                # normalize on it does not do anything.
                 obs = self.obs_normalizer(obs)
-                # print("obs:", obs.shape)
+                pred = self.obs_normalizer(pred)
 
                 self.optimizer.zero_grad()
-                loss = self.compute_loss(obs, labels)
+                loss = self.compute_loss(pred, obs, labels)
                 loss.backward()
 
                 # Compute the norm of gradients
@@ -672,11 +682,31 @@ class Diffusion(object):
 
             if save_dir is not None and epoch % save_freq == 0:
                 self.save(os.path.join(save_dir, f"diffusion_model_epoch_{epoch}.pt"))
+                train_fname = os.path.join(save_dir, "train_losses.npy")
+                test_fname = os.path.join(save_dir, "test_losses.npy")
+                if os.path.exists(train_fname):
+                    os.remove(train_fname)
+                if os.path.exists(test_fname):
+                    os.remove(test_fname)
+
+                np.save(train_fname, train_losses)
+                np.save(test_fname, test_losses)
+
+            # Stop early if the test loss is increasing.
+            if epoch > 20 and test_losses[-1] >= 0.5:
+                break
 
         if save_dir is not None:
             self.save(os.path.join(save_dir, "diffusion_model_final.pt"))
-            np.save(os.path.join(save_dir, "train_losses.npy"), train_losses)
-            np.save(os.path.join(save_dir, "test_losses.npy"), test_losses)
+            train_fname = os.path.join(save_dir, "train_losses.npy")
+            test_fname = os.path.join(save_dir, "test_losses.npy")
+            if os.path.exists(train_fname):
+                os.remove(train_fname)
+            if os.path.exists(test_fname):
+                os.remove(test_fname)
+
+            np.save(train_fname, train_losses)
+            np.save(test_fname, test_losses)
 
         return train_losses, test_losses
 
@@ -735,11 +765,14 @@ def sample(
     num_samples,
     return_steps,
     data_shape,
+    data_loader: Optional[torch.utils.data.DataLoader] = None,
+    obs_normalizer=None,
     labels=None,
     clip=None,
     clip_noise=None,
     cfg_w=None,
     null_class=None,
+    obs_key: str = "state",
     device: str = "cuda",
 ):
     model.model.eval()
@@ -763,14 +796,40 @@ def sample(
     else:
         model_kwargs = {"training": False}
 
+    all_obs = []
     for label in labels:
         label_samples = []
+        label_obs = []
         with torch.no_grad():
             if label is not None:
                 label = torch.tensor(label, dtype=torch.int32, device=device)
                 label = label.expand(num_samples)
             for num_steps in return_steps:
                 ts = np.linspace(1 - 1e-4, 1e-4, num_steps + 1)
+
+                if data_loader is None:
+                    x_shape = (num_samples,) + tuple(data_shape)
+                    obs = None
+                else:
+                    n_obs = 0
+                    obs = []
+                    for obs_history, _ in data_loader:
+                        # [batch_size, n_obs_history, dim]
+                        obs_history = obs_history[obs_key]
+
+                        if obs_normalizer is not None:
+                            obs_history = obs_normalizer(obs_history)
+
+                        obs.append(obs_history)
+                        n_obs += obs_history.shape[0]
+                        if n_obs >= num_samples:
+                            break
+
+                    # [num_samples, n_obs_history, dim]
+                    obs = torch.cat(obs, dim=0)[:num_samples].to(device)
+                    label_obs.append(obs.detach().cpu().numpy())
+                    # Concatenate observations along the time dimension.
+                    obs = obs.flatten(1)  # [num_samples n_obs_history * dim]
 
                 x = torch.randn(x_shape, device=device)
                 for i in range(num_steps):
@@ -786,7 +845,7 @@ def sample(
                     if torch.isnan(x).any():
                         print("nan x at step = ", i)
                     eps_hat = model.model_fn(
-                        x, label, t.expand(num_samples), **model_kwargs
+                        x, label, t.expand(num_samples), global_cond=obs, **model_kwargs
                     )
                     # assert not torch.isnan(eps_hat).any(), f"step: [{i}/{num_steps}], t: {t}"
                     if torch.isnan(eps_hat).any():
@@ -806,16 +865,24 @@ def sample(
                         sigma_tm1,
                         clip=clip,
                         clip_noise=clip_noise,
+                        device=device,
                     )
 
                 label_samples.append(x.cpu().detach().numpy())
             samples.append(label_samples)
 
+        all_obs.append(label_obs)
+
     # Squeeze out the label and return_steps dimensions if there's only.
     samples = np.array(samples)
     if len(labels) == 1:
         samples = samples.squeeze(0)
-    return samples
+
+    all_obs = np.array(all_obs)
+    if len(labels) == 1:
+        all_obs = all_obs.squeeze(0)
+
+    return samples, all_obs
 
 
 def _get_alpha_sigma(t):
@@ -877,19 +944,19 @@ def train_diffusion():
     device = "cuda"
     batch_size = 256
     n_obs_history = 8
-    n_pred_horizon = 0
+    n_pred_horizon = 8
     diffusion_step_embed_dim = 256
     n_epochs = 250
-    lr = 1e-3
+    lr = 3e-4
     use_ema_helper = True
     path = (
         "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
     root_save_dir = "models/diffusion/"
-    load_dir = "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_0_bs_256_lr_0.001_e_250_ema_norm_latent_standard_normal/2024-05-05_23-17-16"
+    load_dir = "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
     save_freq = 30
     # Options: "standard_normal", "uniform", False
-    normalize_latent = "standard_normal"
+    normalize_latent = "uniform"
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
@@ -998,19 +1065,21 @@ def train_diffusion():
     else:
         obs_normalizer = None
 
-    if n_obs_history == 1:
+    if n_pred_horizon == 1:
         down_dims = [128, 256]
-    elif n_obs_history == 4:
+    elif n_pred_horizon == 4:
         down_dims = [128, 256, 512]
-    elif n_obs_history == 8:
+    elif n_pred_horizon == 8:
         down_dims = [128, 256, 512, 1024]
     else:
         raise NotImplementedError()
 
+    global_cond_dim = STATE_DIM * n_obs_history
     diff_model = conditional_unet1d.ConditionalUnet1D(
         input_dim=STATE_DIM,
         down_dims=down_dims,
         diffusion_step_embed_dim=diffusion_step_embed_dim,
+        global_cond_dim=global_cond_dim,
     ).to(device)
 
     optim_kwargs = dict(lr=lr)
@@ -1070,20 +1139,26 @@ def train_diffusion():
             np.save(os.path.join(save_dir, "latent_max.npy"), latent_max)
 
     # Sample.
-    data_shape = (
-        (n_obs_history, STATE_DIM) if n_obs_history > 0 else (n_pred_horizon, STATE_DIM)
-    )
+    data_shape = (n_pred_horizon, STATE_DIM)
     return_steps = [512]
     num_samples = 1000
-    normalized_samples = sample(
+    # [len(return_steps), num_samples, n_pred_horizon, dim] and
+    # [len(return_steps), num_samples, n_obs_history, dim)]
+    normalized_samples, normalized_obs = sample(
         diffusion,
         num_samples=num_samples,
         return_steps=return_steps,
         data_shape=data_shape,
+        data_loader=train_loader,
+        obs_normalizer=obs_normalizer,
         clip=None,
         clip_noise=(-3, 3),
         device=device,
+        obs_key=obs_key,
     )
+
+    # Concatenate samples and observations along the time dimension.
+    normalized_samples = np.concatenate([normalized_obs, normalized_samples], axis=2)
 
     if obs_key == "img":
         # Decode using VAE.
@@ -1093,18 +1168,13 @@ def train_diffusion():
         # Decode the samples in batches
         decoded_normalized_samples = []
         num_batches = 10  # num_samples // batch_size
-        reshape_batch_shape = (
-            [batch_size, n_obs_history]
-            if n_obs_history != 0
-            else [batch_size, n_pred_horizon]
-        )
+        reshape_batch_shape = [batch_size, n_obs_history + n_pred_horizon]
 
         if normalize_latent == "uniform":
             # Remove samples that are out of the range [-1, 1].
             mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
                 axis=(-2, -1)
             )
-            # mask = np.ones_like(mask, dtype=bool)
             # Range: [-1, 1] (for real now)
             in_range_normalized_samples = normalized_samples[mask][None]
         else:
@@ -1112,9 +1182,11 @@ def train_diffusion():
 
         for i in trange(0, num_batches, batch_size):
             # Range: [-1, 1]
+            # [batch_size, (n_obs_history + n_pred_horizon), latent_dim]
             normalized_batch_samples = in_range_normalized_samples[
                 0, i : i + batch_size
-            ]  # [batch_size * n_obs_history, latent_dim]
+            ]
+            # [batch_size * (n_obs_history + n_pred_horizon), latent_dim]
             normalized_batch_samples = normalized_batch_samples.reshape(
                 (-1, normalized_batch_samples.shape[-1])
             )
