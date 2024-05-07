@@ -1,0 +1,6 @@
+gym==0.26.2
+pymunk==6.2.1
+pygame==2.1.2
+shapely==1.8.4
+opencv-python
+scikit-image

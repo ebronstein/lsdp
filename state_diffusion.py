@@ -5,7 +5,7 @@ import functools
 import math
 import os
 import sys
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 if "PyTorch_VAE" not in sys.path:
     sys.path.append("PyTorch_VAE")
@@ -522,7 +522,7 @@ def sample(
     num_samples,
     return_steps,
     data_shape,
-    data_loader: Optional[torch.utils.data.DataLoader] = None,
+    obs_data: Optional[Union[torch.utils.data.DataLoader, torch.Tensor]] = None,
     obs_normalizer=None,
     labels=None,
     clip=None,
@@ -531,7 +531,7 @@ def sample(
     null_class=None,
     obs_key: str = "state",
     device: str = "cuda",
-):
+) -> tuple[np.ndarray, np.ndarray]:
     model.model.eval()
     if not isinstance(data_shape, (list, tuple)):
         data_shape = (data_shape,)
@@ -564,29 +564,36 @@ def sample(
             for num_steps in return_steps:
                 ts = np.linspace(1 - 1e-4, 1e-4, num_steps + 1)
 
-                if data_loader is None:
+                if obs_data is None:
                     x_shape = (num_samples,) + tuple(data_shape)
                     obs = None
                 else:
-                    n_obs = 0
-                    obs = []
-                    for obs_history, _ in data_loader:
-                        # [batch_size, n_obs_history, dim]
-                        obs_history = obs_history[obs_key]
+                    if isinstance(obs_data, torch.utils.data.DataLoader):
+                        n_obs = 0
+                        obs_list = []
+                        for obs_history, _ in obs_data:
+                            # [batch_size, n_obs_history, dim]
+                            obs_history = obs_history[obs_key]
 
+                            if obs_normalizer is not None:
+                                obs_history = obs_normalizer(obs_history)
+
+                            obs_list.append(obs_history)
+                            n_obs += obs_history.shape[0]
+                            if n_obs >= num_samples:
+                                break
+
+                        # [num_samples, n_obs_history, dim]
+                        obs = torch.cat(obs_list, dim=0)[:num_samples]
+                    else:
+                        # The observations are passed as a tensor.
+                        obs = obs_data
                         if obs_normalizer is not None:
-                            obs_history = obs_normalizer(obs_history)
+                            obs = obs_normalizer(obs)
 
-                        obs.append(obs_history)
-                        n_obs += obs_history.shape[0]
-                        if n_obs >= num_samples:
-                            break
-
-                    # [num_samples, n_obs_history, dim]
-                    obs = torch.cat(obs, dim=0)[:num_samples].to(device)
                     label_obs.append(obs.detach().cpu().numpy())
                     # Concatenate observations along the time dimension.
-                    obs = obs.flatten(1)  # [num_samples n_obs_history * dim]
+                    obs = obs.flatten(1)  # [num_samples, n_obs_history * dim]
 
                 x = torch.randn(x_shape, device=device)
                 for i in range(num_steps):
@@ -905,7 +912,7 @@ def train_diffusion():
         num_samples=num_samples,
         return_steps=return_steps,
         data_shape=data_shape,
-        data_loader=train_loader,
+        obs_data=train_loader,
         obs_normalizer=obs_normalizer,
         clip=None,
         clip_noise=(-3, 3),
