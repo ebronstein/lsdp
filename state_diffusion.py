@@ -18,33 +18,23 @@ from torch.utils.data import Dataset
 from tqdm.notebook import tqdm, trange
 
 import wandb
+from data_utils import EpisodeDataset
 from diffusion_policy.common.pytorch_util import compute_conv_output_shape
 from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 from diffusion_policy.model.diffusion import conditional_unet1d
 from ema import EMAHelper
 from PyTorch_VAE import models
-
-
-def plot_losses(train_losses, test_losses, save_dir=None):
-    # Plot train and test losses.
-    plt.figure(figsize=(12, 6))
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(
-        np.linspace(0, len(train_losses), len(test_losses)),
-        test_losses,
-        label="Test Loss",
-    )
-    # Remove outliers for better visualization
-    # plt.ylim(0, 0.01)
-    plt.xlabel("Iterations")
-    plt.ylabel("Loss")
-    plt.legend()
-
-    if save_dir is not None:
-        plt.savefig(os.path.join(save_dir, "train_test_losses.png"))
-    else:
-        plt.show()
+from utils import (
+    denormalize_img,
+    denormalize_pn1,
+    denormalize_standard_normal,
+    normalize_img,
+    normalize_pn1,
+    normalize_standard_normal,
+    plot_losses,
+)
+from vae import VanillaVAE
 
 
 def plot_samples(samples, data, return_steps, save_dir=None):
@@ -103,28 +93,6 @@ def plot_img_samples(imgs, num_rollouts: int = 10, save_dir=None):
         plt.show()
 
 
-def normalize_pn1(x, min_val, max_val):
-    # Normalize to [0, 1]
-    nx = (x - min_val) / (max_val - min_val)
-    # Normalize to [-1, 1]
-    return nx * 2 - 1
-
-
-def denormalize_pn1(nx, min_val, max_val):
-    # Denormalize from [-1, 1]
-    x = (nx + 1) / 2
-    # Denormalize from [0, 1]
-    return x * (max_val - min_val) + min_val
-
-
-def normalize_standard_normal(x, mean, std):
-    return (x - mean) / std
-
-
-def denormalize_standard_normal(nx, mean, std):
-    return nx * std + mean
-
-
 # TODO: use this and make it general using an abstract class.
 # class StandardNormalDataNormalizer(nn.Module):
 #     def __init__(self, input_dim, n_obs_history, obs_key: str):
@@ -169,217 +137,6 @@ def denormalize_standard_normal(nx, mean, std):
 #         state_dict = torch.load(filepath)
 #         self.mean = nn.Parameter(state_dict["mean"], requires_grad=False)
 #         self.std = nn.Parameter(state_dict["std"], requires_grad=False)
-
-
-class EpisodeDataset(Dataset):
-    def __init__(
-        self,
-        dataset,
-        n_obs_history=1,
-        n_pred_horizon=1,
-        episode_idxs=None,
-        include_keys: Optional[list[str]] = None,
-        process_fns: Optional[dict[str, Callable]] = None,
-        device: str = "cpu",
-    ):
-        """
-        Initialize the dataset with the main dataset object that contains
-        the replay_buffer. Also, specify the lengths of observation history
-        and prediction horizon.
-        """
-        self.dataset = dataset
-        self.n_obs_history = n_obs_history
-        self.n_pred_horizon = n_pred_horizon
-        self.episode_idxs = list(episode_idxs)
-        self.include_keys = set(include_keys) if include_keys is not None else None
-        if not self.include_keys:
-            raise ValueError("At least one key must be included in the dataset.")
-        self.process_fns = process_fns
-        self.device = device
-        self.prepare_data()
-
-    def prepare_data(self):
-        """
-        Preprocess the episodes to create a flat list of samples.
-        Each sample is a tuple of dictionaries: (obs_history, pred_horizon).
-        """
-        self.samples = []
-
-        if self.episode_idxs is None:
-            self.episode_idxs = range(self.dataset.replay_buffer.n_episodes)
-
-        for episode_idx in tqdm(self.episode_idxs, desc="Preparing data"):
-            episode = self.dataset.replay_buffer.get_episode(episode_idx)
-
-            obs = {}
-
-            if self.include_keys is None or "img" in self.include_keys:
-                img = episode["img"].transpose(0, 3, 1, 2)  # CHW format
-                if "img" in self.process_fns:
-                    img = self.process_fns["img"](img)
-                obs["img"] = torch.tensor(img, dtype=torch.float32).to(self.device)
-
-            if self.include_keys is None or "action" in self.include_keys:
-                action = episode["action"]
-                if "action" in self.process_fns:
-                    action = self.process_fns["action"](action)
-                obs["action"] = torch.tensor(action, dtype=torch.float32).to(
-                    self.device
-                )
-
-            if self.include_keys is None or "state" in self.include_keys:
-                state = episode["state"]
-                if "state" in self.process_fns:
-                    state = self.process_fns["state"](state)
-                obs["state"] = torch.tensor(state, dtype=torch.float32).to(self.device)
-
-            # Iterate through the episode to create samples with observation history and prediction horizon
-            n_obs = len(list(obs.values())[0])
-            for i in range(n_obs - self.n_obs_history - self.n_pred_horizon + 1):
-                obs_history = {}
-                pred_horizon = {}
-
-                for key, value in obs.items():
-                    obs_history[key] = value[i : i + self.n_obs_history]
-                    pred_horizon[key] = value[
-                        i
-                        + self.n_obs_history : i
-                        + self.n_obs_history
-                        + self.n_pred_horizon
-                    ]
-
-                self.samples.append((obs_history, pred_horizon))
-
-    def __len__(self):
-        """
-        Return the total number of samples across all episodes.
-        """
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        """
-        Return the idx-th sample from the dataset.
-        """
-        obs_history, pred_horizon = self.samples[idx]
-
-        # Convert data to PyTorch tensors and ensure the data type is correct
-        # for key, value in obs_history.items():
-        #     obs_history[key] = torch.tensor(value, dtype=torch.float32)
-        # for key, value in pred_horizon.items():
-        #     pred_horizon[key] = torch.tensor(value, dtype=torch.float32)
-
-        return obs_history, pred_horizon
-
-
-class VanillaVAE(models.VanillaVAE):
-
-    def __init__(
-        self,
-        in_channels: int,
-        in_height: int,
-        in_width: int,
-        latent_dim: int,
-        hidden_dims: Optional[list] = None,
-        **kwargs,
-    ) -> None:
-        models.BaseVAE.__init__(self)
-
-        self.latent_dim = latent_dim
-
-        modules = []
-        if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
-
-        # Build Encoder
-        kernel_size = 3
-        stride = 2
-        padding = 1
-        dilation = 1
-        for h_dim in hidden_dims:
-            modules.append(
-                nn.Sequential(
-                    nn.Conv2d(
-                        in_channels,
-                        out_channels=h_dim,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=padding,
-                        dilation=dilation,
-                    ),
-                    nn.BatchNorm2d(h_dim),
-                    nn.LeakyReLU(),
-                )
-            )
-            in_channels = h_dim
-
-        self.conv_out_shape = compute_conv_output_shape(
-            H=in_height,
-            W=in_width,
-            padding=padding,
-            stride=stride,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            num_layers=len(hidden_dims),
-            last_hidden_dim=hidden_dims[-1],
-        )
-        conv_out_size = np.prod(self.conv_out_shape)
-
-        self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(conv_out_size, latent_dim)
-        self.fc_var = nn.Linear(conv_out_size, latent_dim)
-
-        # Build Decoder
-        modules = []
-
-        self.decoder_input = nn.Linear(latent_dim, conv_out_size)
-
-        hidden_dims.reverse()
-
-        for i in range(len(hidden_dims) - 1):
-            modules.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(
-                        hidden_dims[i],
-                        hidden_dims[i + 1],
-                        kernel_size=3,
-                        stride=2,
-                        padding=1,
-                        output_padding=1,
-                    ),
-                    nn.BatchNorm2d(hidden_dims[i + 1]),
-                    nn.LeakyReLU(),
-                )
-            )
-
-        self.decoder = nn.Sequential(*modules)
-
-        self.final_layer = nn.Sequential(
-            nn.ConvTranspose2d(
-                hidden_dims[-1],
-                hidden_dims[-1],
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                output_padding=1,
-            ),
-            nn.BatchNorm2d(hidden_dims[-1]),
-            nn.LeakyReLU(),
-            nn.Conv2d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
-            nn.Tanh(),
-        )
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Maps the given latent codes
-        onto the image space.
-        :param z: (Tensor) [B x D]
-        :return: (Tensor) [B x C x H x W]
-        """
-        result = self.decoder_input(z)
-        result = result.view(-1, *self.conv_out_shape)
-        result = self.decoder(result)
-        result = self.final_layer(result)
-        return result
 
 
 class DiffusionMLP(nn.Module):
@@ -991,8 +748,7 @@ def train_diffusion():
         vae_model.load_state_dict(torch.load(vae_model_path))
 
         def get_latent(x, vae_model, device):
-            x = x / 255.0
-            x = 2.0 * x - 1.0
+            x = normalize_img(x)
             return vae_model.encode(torch.from_numpy(x).to(device))[0].detach()
 
         normalize_encoder_input = functools.partial(
@@ -1221,10 +977,8 @@ def train_diffusion():
 
         # Denormalize.
         view_recons = decoded_normalized_samples.transpose(0, 1, 3, 4, 2)
-        # Range: [0, 1]
-        view_recons = (view_recons + 1) / 2
         # Range: [0, 255]
-        view_recons *= 255
+        view_recons = denormalize_img(view_recons)
         view_recons = view_recons.astype(np.uint8)
 
         # Save image samples.
