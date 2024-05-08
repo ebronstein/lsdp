@@ -74,7 +74,7 @@ def plot_samples(samples, data, return_steps, save_dir=None):
             plt.show()
 
 
-def plot_img_samples(imgs, num_rollouts: int = 10, save_dir=None):
+def plot_img_samples(imgs, num_rollouts: int = 10, prefix=None, save_dir=None):
     # imgs shape: [N, n_obs_history, C, H, W]
     n_obs_history = imgs.shape[1]
     fig, axs = plt.subplots(
@@ -88,7 +88,11 @@ def plot_img_samples(imgs, num_rollouts: int = 10, save_dir=None):
     fig.tight_layout()
 
     if save_dir is not None:
-        plt.savefig(os.path.join(save_dir, "img_samples.png"))
+        if prefix:
+            fname = f"{prefix}_img_samples.png"
+        else:
+            fname = "img_samples.png"
+        plt.savefig(os.path.join(save_dir, fname))
     else:
         plt.show()
 
@@ -293,9 +297,11 @@ class Diffusion(object):
         )
         return train_loader, test_loader
 
+    # @torch.jit.script
     def get_alpha(self, t):
         return torch.cos(np.pi / 2 * t).to(self.device)
 
+    # @torch.jit.script
     def get_sigma(self, t):
         return torch.sin(np.pi / 2 * t).to(self.device)
 
@@ -478,37 +484,52 @@ def ddpm_update(
     clip=None,
     clip_noise=None,
     device: str = "cuda",
+    DEBUG=False,
 ):
+    """
+    DEBUG: it activates the checks for nans and other potential issues
+    This is for speed.
+    """
     # assert not torch.isnan(eps_hat).any()
     # assert not torch.isnan(sigma_t).any()
     # assert alpha_t.abs().min() > 1e-6
-    if torch.isnan(eps_hat).any():
-        print("nan eps_hat")
-    if torch.isnan(sigma_t).any():
-        print("nan sigma_t")
-    if alpha_t.abs().min() < 1e-6:
-        print("alpha_t is too small")
     eta_t = sigma_tm1 / sigma_t * torch.sqrt(1 - alpha_t.pow(2) / alpha_tm1.pow(2))
-    # assert not torch.isnan(eta_t).any()
-    if torch.isnan(eta_t).any():
-        print("nan eta_t")
     x_tm1_mean = (x - sigma_t * eps_hat) / alpha_t
-    # assert not torch.isnan(x_tm1_mean).any()
-    if torch.isnan(x_tm1_mean).any():
-        print("nan x_tm1_mean")
+
+    if DEBUG:
+        if torch.isnan(eps_hat).any():
+            print("nan eps_hat")
+        if torch.isnan(sigma_t).any():
+            print("nan sigma_t")
+        if alpha_t.abs().min() < 1e-6:
+            print("alpha_t is too small")
+
+        # assert not torch.isnan(eta_t).any()
+        if torch.isnan(eta_t).any():
+            print("nan eta_t")
+
+        # assert not torch.isnan(x_tm1_mean).any()
+        if torch.isnan(x_tm1_mean).any():
+            print("nan x_tm1_mean")
+
     if clip is not None:
         min, max = clip
         x_tm1_mean = torch.clamp(x_tm1_mean, min, max)
     update_term = alpha_tm1 * x_tm1_mean
-    # assert not torch.isnan(update_term).any()
-    if torch.isnan(update_term).any():
-        print("nan update_term")
+
+    if DEBUG:
+        # assert not torch.isnan(update_term).any()
+        if torch.isnan(update_term).any():
+            print("nan update_term")
+
     noise_term = (
         torch.sqrt(torch.clamp(sigma_tm1.pow(2) - eta_t.pow(2), min=0)) * eps_hat
     )
-    # assert not torch.isnan(noise_term).any()
-    if torch.isnan(noise_term).any():
-        print("nan noise_term")
+    if DEBUG:
+        # assert not torch.isnan(noise_term).any()
+        if torch.isnan(noise_term).any():
+            print("nan noise_term")
+
     random_noise = torch.randn_like(x, device=device)
     if clip_noise:
         random_noise = torch.clamp(random_noise, clip_noise[0], clip_noise[1])
@@ -721,6 +742,7 @@ def train_diffusion():
     save_freq = 30
     # Options: "standard_normal", "uniform", False
     normalize_latent = "uniform"
+    sample_from_train_loader = False
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
@@ -907,6 +929,7 @@ def train_diffusion():
     num_samples = 1000
     # [len(return_steps), num_samples, n_pred_horizon, dim] and
     # [len(return_steps), num_samples, n_obs_history, dim)]
+    sample_data_loader = train_loader if sample_from_train_loader else val_loader
     normalized_samples, normalized_obs = sample(
         diffusion,
         num_samples=num_samples,
@@ -989,10 +1012,12 @@ def train_diffusion():
         view_recons = view_recons.astype(np.uint8)
 
         # Save image samples.
-        plot_img_samples(view_recons, save_dir=save_dir)
+        img_samples_prefix = "train" if sample_from_train_loader else "val"
+        plot_img_samples(view_recons, prefix=img_samples_prefix, save_dir=save_dir)
 
         # Save image samples as numpy arrays.
         np.save(os.path.join(save_dir, "img_samples.npy"), view_recons)
+
     elif obs_key == "state":
         # TODO: implement this.
         in_range_normalized_samples = []
