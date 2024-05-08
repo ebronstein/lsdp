@@ -1,3 +1,5 @@
+*.avi
+*.gif
 bin
 logs
 wandb
