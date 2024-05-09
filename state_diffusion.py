@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from sacred import Experiment
+from sacred.observers import FileStorageObserver
 from torch.utils.data import Dataset
 from tqdm.notebook import tqdm, trange
 
@@ -35,6 +37,29 @@ from utils import (
     plot_losses,
 )
 from vae import VanillaVAE
+
+ex = Experiment()
+
+
+def get_exp_dir(
+    save_dir,
+    obs_key,
+    down_dims,
+    diffusion_step_embed_dim,
+    n_obs_history,
+    n_pred_horizon,
+    batch_size,
+    lr,
+    n_epochs,
+    use_ema_helper,
+    normalize_latent,
+):
+    ema_tag = "_ema" if use_ema_helper else ""
+    name = (
+        f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
+        f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}_norm_latent_{normalize_latent}"
+    )
+    return os.path.join(save_dir, name)
 
 
 def plot_samples(samples, data, return_steps, save_dir=None):
@@ -723,26 +748,73 @@ def sample_pieter(
     return x
 
 
-def train_diffusion():
-    # TODO: make these into args
+@ex.config
+def sacred_config():
+    # Data
     obs_key = "img"
-    device = "cuda"
-    batch_size = 256
-    n_obs_history = 8
-    n_pred_horizon = 8
-    diffusion_step_embed_dim = 256
-    n_epochs = 250
-    lr = 3e-4
-    use_ema_helper = True
     path = (
         "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
-    root_save_dir = "models/diffusion/"
-    load_dir = "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
-    save_freq = 30
+
+    # Model
+    n_obs_history = 8
+    n_pred_horizon = 8
+    diffusion_step_embed_dim = 256
+    down_dims = [128, 256, 512, 1024]
+    use_ema_helper = True
+    load_dir = None  # "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
     # Options: "standard_normal", "uniform", False
     normalize_latent = "uniform"
+    vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+
+    # Training
+    batch_size = 256
+    n_epochs = 250
+    lr = 3e-4
+    save_freq = 30
+    device = "cuda"
+
+    # Sampling
     sample_from_train_loader = False
+
+    # Saving
+    root_save_dir = "models/diffusion/"
+    exp_dir = get_exp_dir(
+        root_save_dir,
+        obs_key,
+        down_dims,
+        diffusion_step_embed_dim,
+        n_obs_history,
+        n_pred_horizon,
+        batch_size,
+        lr,
+        n_epochs,
+        use_ema_helper,
+        normalize_latent,
+    )
+
+    # NOTE: set the observers to this single FileStorageObserver instead of
+    # appending to ex.observers. This allows running the experiment multiple
+    # times without creating multiple observers.
+    ex.observers = [FileStorageObserver(exp_dir, copy_sources=False)]
+
+
+@ex.automain
+def train_diffusion(_config, _run, _log):
+    obs_key = _config["obs_key"]
+    device = _config["device"]
+    batch_size = _config["batch_size"]
+    n_obs_history = _config["n_obs_history"]
+    n_pred_horizon = _config["n_pred_horizon"]
+    diffusion_step_embed_dim = _config["diffusion_step_embed_dim"]
+    n_epochs = _config["n_epochs"]
+    lr = _config["lr"]
+    use_ema_helper = _config["use_ema_helper"]
+    path = _config["path"]
+    load_dir = _config["load_dir"]
+    save_freq = _config["save_freq"]
+    normalize_latent = _config["normalize_latent"]
+    sample_from_train_loader = _config["sample_from_train_loader"]
 
     dataset = PushTImageDataset(path)
     full_dataset = torch.from_numpy(dataset.replay_buffer["img"]).permute(0, 3, 1, 2)
@@ -766,7 +838,7 @@ def train_diffusion():
         STATE_DIM = latent_dim = 32
 
         # Load VAE.
-        vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+        vae_model_path = _config["vae_model_path"]
         vae_model = VanillaVAE(
             in_channels=3,
             in_height=H,
@@ -850,14 +922,16 @@ def train_diffusion():
     else:
         obs_normalizer = None
 
-    if n_pred_horizon == 1:
-        down_dims = [128, 256]
-    elif n_pred_horizon == 4:
-        down_dims = [128, 256, 512]
-    elif n_pred_horizon == 8:
-        down_dims = [128, 256, 512, 1024]
-    else:
-        raise NotImplementedError()
+    down_dims = _config["down_dims"]
+    if down_dims is None:
+        if n_pred_horizon == 1:
+            down_dims = [128, 256]
+        elif n_pred_horizon == 4:
+            down_dims = [128, 256, 512]
+        elif n_pred_horizon == 8:
+            down_dims = [128, 256, 512, 1024]
+        else:
+            raise NotImplementedError()
 
     global_cond_dim = STATE_DIM * n_obs_history
     diff_model = conditional_unet1d.ConditionalUnet1D(
@@ -879,27 +953,18 @@ def train_diffusion():
         use_ema_helper=use_ema_helper,
     )
 
+    # Run directory.
+    run_id = _run._id
+    run_dir = os.path.join(_config["exp_dir"], run_id)
+    save_dir = run_dir
+    _log.info(f"Saving to {save_dir}")
+
     # Train or load.
     if load_dir is not None:
-        save_dir = load_dir
         diffusion.load(os.path.join(load_dir, "diffusion_model_final.pt"))
         train_losses = np.load(os.path.join(load_dir, "train_losses.npy"))
         test_losses = np.load(os.path.join(load_dir, "test_losses.npy"))
     else:
-        if root_save_dir is not None:
-            ema_tag = "_ema" if use_ema_helper else ""
-            name = (
-                f'pusht_unet1d_{obs_key}_{str(down_dims)[1:-1].replace(", ", "_")}_edim_{diffusion_step_embed_dim}_'
-                f"obs_{n_obs_history}_pred_{n_pred_horizon}_bs_{batch_size}_lr_{lr}_e_{n_epochs}{ema_tag}_norm_latent_{normalize_latent}"
-            )
-            save_dir = os.path.join(root_save_dir, name)
-            # Get the current timestamp and save it as a new directory.
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            save_dir = os.path.join(save_dir, timestamp)
-            os.makedirs(save_dir)
-        else:
-            save_dir = None
-
         train_losses, test_losses = diffusion.train(
             obs_key=obs_key,
             save_freq=save_freq,
@@ -907,9 +972,6 @@ def train_diffusion():
             save_dir=save_dir,
             add_timestamp_to_save_dir=False,
         )
-
-    if save_dir is not None:
-        print(f"Saving to {save_dir}")
 
     # Plot losses.
     plot_losses(train_losses, test_losses, save_dir=save_dir)
@@ -927,15 +989,15 @@ def train_diffusion():
     data_shape = (n_pred_horizon, STATE_DIM)
     return_steps = [512]
     num_samples = 1000
-    # [len(return_steps), num_samples, n_pred_horizon, dim] and
-    # [len(return_steps), num_samples, n_obs_history, dim)]
     sample_data_loader = train_loader if sample_from_train_loader else val_loader
+    # Shapes: [len(return_steps), num_samples, n_pred_horizon, dim] and
+    # [len(return_steps), num_samples, n_obs_history, dim)]
     normalized_samples, normalized_obs = sample(
         diffusion,
         num_samples=num_samples,
         return_steps=return_steps,
         data_shape=data_shape,
-        obs_data=train_loader,
+        obs_data=sample_data_loader,
         obs_normalizer=obs_normalizer,
         clip=None,
         clip_noise=(-3, 3),
@@ -1019,7 +1081,6 @@ def train_diffusion():
         np.save(os.path.join(save_dir, "img_samples.npy"), view_recons)
 
     elif obs_key == "state":
-        # TODO: implement this.
         in_range_normalized_samples = []
         for num_steps in range(normalized_samples.shape[0]):
             mask = ((normalized_samples >= -1) & (normalized_samples <= 1)).all(
@@ -1027,18 +1088,21 @@ def train_diffusion():
             )
             in_range_normalized_samples.append(normalized_samples[mask])
 
-        # [len(return_steps), num_in_range_samples, n_obs_history, dim=5]
+        # [len(return_steps), num_in_range_samples, n_obs_history + n_pred_horizon, dim=5]
         in_range_samples = np.array(
             [
                 denormalize_pn1(s, min_state, max_state)
                 for s in in_range_normalized_samples
             ]
         )
+        # Remove the observation history and only keep the predictions.
+        # [len(return_steps), num_in_range_samples, n_pred_horizon, dim=5]
+        in_range_pred_samples = in_range_samples[:, :, n_obs_history:]
 
         # Plot samples histogram.
         n_data, state_dim = dataset.replay_buffer[obs_key].shape
         plot_samples(
-            in_range_samples,
+            in_range_pred_samples,
             np.broadcast_to(
                 dataset.replay_buffer[obs_key][:, None],
                 [n_data, n_obs_history, state_dim],
@@ -1063,13 +1127,9 @@ def train_diffusion():
             diff_states, axis=0
         )  # [n_samples, n_history - 1, dim]
         diff_samples = np.diff(
-            in_range_samples, axis=2
+            in_range_pred_samples, axis=2
         )  # [len(return_steps), num_in_range_samples, n_history - 1, dim]
 
         plot_samples(
             diff_samples, diff_states, return_steps=return_steps, save_dir=save_dir
         )
-
-
-if __name__ == "__main__":
-    train_diffusion()
