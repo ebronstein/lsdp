@@ -1,4 +1,7 @@
+*.json
+models/diffusion
 *.avi
+PyTorch_VAE
 *.gif
 bin
 logs

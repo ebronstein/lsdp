@@ -40,7 +40,6 @@ from vae import VanillaVAE
 
 ex = Experiment()
 
-
 def get_exp_dir(
     save_dir,
     obs_key,
@@ -752,9 +751,23 @@ def sample_pieter(
 def sacred_config():
     # Data
     obs_key = "img"
-    path = (
-        "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
-    )
+
+    # automatic select the path
+    if os.path.exists("/nas/ucb/ebronstein/lsdp/"):
+        path = "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
+        vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+
+    elif os.path.exists("/home/matteogu/ssd_data/"):
+        path = "/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr"
+        vae_model_path = "/home/matteogu/Desktop/prj_deepul/repo_online/lsdp/models/pusht_vae/vae_32_20240403.pt"
+
+    elif os.path.exists("/home/tsadja/data_diffusion/"):
+        path = "/home/tsadja/data_diffusion/pusht/pusht_cchi_v7_replay.zarr"
+        raise NotImplementedError
+        vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
+
+    else:
+        raise NotImplementedError
 
     # Model
     n_obs_history = 8
@@ -765,7 +778,6 @@ def sacred_config():
     load_dir = None  # "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
     # Options: "standard_normal", "uniform", False
     normalize_latent = "uniform"
-    vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
 
     # Training
     batch_size = 256
