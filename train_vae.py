@@ -124,7 +124,6 @@ def train(model, train_loader, val_loader, epochs, optimizer, kl_loss_coeff, dev
         val_losses.append(total_val_loss / len(val_loader))
         print(f"Validation loss: {val_losses[-1]:.4f}")
 
-
     return train_losses, val_losses
 
 
@@ -189,7 +188,12 @@ def main(_config, _run, _log):
             data_files = [file for file in os.listdir(path) if file.endswith(".npy")]
             for file in tqdm(data_files):
                 file_path = os.path.join(path, file)
-                datasets.append(np.load(file_path))
+                data = np.load(file_path)
+                # Multiply by 255 because it is in the range [0, 1], and it
+                # should be in [0, 255] to match the PushTImageDataset .zarr
+                # files.
+                data *= 255
+                datasets.append(data)
 
     full_dataset = np.concatenate(datasets, axis=0)
 
@@ -218,7 +222,9 @@ def main(_config, _run, _log):
     train_dataset = CustomDataset(train_dataset, transform=transforms)
     val_dataset = CustomDataset(val_dataset)
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
         # num_workers=8
     )
     val_loader = torch.utils.data.DataLoader(
@@ -261,4 +267,5 @@ def main(_config, _run, _log):
     plot_losses(train_losses, test_losses, save_dir=run_dir)
 
     # Plot the reconstructions.
-    show_reconstructions(model, val_loader, device, sample=False, save_dir=run_dir)
+    for sample in [True, False]:
+        show_reconstructions(model, val_loader, device, sample=sample, save_dir=run_dir)
