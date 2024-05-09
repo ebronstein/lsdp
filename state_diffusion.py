@@ -5,7 +5,7 @@ import functools
 import math
 import os
 import sys
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List, Tuple
 
 if "PyTorch_VAE" not in sys.path:
     sys.path.append("PyTorch_VAE")
@@ -293,33 +293,44 @@ class Diffusion(object):
         )
         return train_loader, test_loader
 
-    def get_alpha(self, t):
-        return torch.cos(np.pi / 2 * t).to(self.device)
 
-    def get_sigma(self, t):
-        return torch.sin(np.pi / 2 * t).to(self.device)
+    @staticmethod
+    @torch.jit.script
+    def get_alpha(t: torch.Tensor) -> torch.Tensor:
+        return torch.cos(np.pi / 2 * t)
+
+    @staticmethod
+    @torch.jit.script
+    def get_sigma(t: torch.Tensor) -> torch.Tensor:
+        return torch.sin(np.pi / 2 * t)
+
+    @staticmethod
+    @torch.jit.script
+    def get_alpha_and_sigma(t: torch.Tensor, shape: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        _t = np.pi / 2 * t.view(shape)
+        alpha = torch.cos(_t)
+        sigma = torch.sin(_t)
+        return alpha, sigma
+
 
     def compute_loss(self, x, obs, labels=None):
         batch_size = x.shape[0]
+        exp_shape = [batch_size] + [1] * (len(x.shape) - 1)
 
         # Step 1: Sample diffusion timestep uniformly in [0, 1]
         t = torch.rand(batch_size, device=self.device)  # [batch_size]
 
         # Step 2: Compute noise-strength
-        alpha_t = self.get_alpha(t)
-        sigma_t = self.get_sigma(t)
+        alpha_t, sigma_t = self.get_alpha_and_sigma(t, exp_shape)
+        # alpha_t = self.get_alpha(t)
+        # sigma_t = self.get_sigma(t)
+        # alpha_t = alpha_t.view(exp_shape)
+        # sigma_t = sigma_t.view(exp_shape)
 
         # Step 3: Apply forward process
         epsilon = torch.randn_like(x, device=self.device)
-        exp_shape = [batch_size] + [1] * (len(x.shape) - 1)
-        alpha_t = alpha_t.view(exp_shape)
-        sigma_t = sigma_t.view(exp_shape)
-        # Print shapes
-        # print("x:", x.shape)
-        # print("alpha_t:", alpha_t.shape)
-        # print("sigma_t:", sigma_t.shape)
-        # print("epsilon:", epsilon.shape)
-        x_t = alpha_t * x + sigma_t * epsilon  # x.shape
+
+        x_t = alpha_t * x + sigma_t * epsilon
 
         # Flatten obs
         obs = obs.flatten(1)  # [batch_size, n_history * global_cond_dim]
@@ -410,13 +421,14 @@ class Diffusion(object):
                 loss = self.compute_loss(pred, obs, labels)
                 loss.backward()
 
-                # Compute the norm of gradients
-                total_norm = 0
-                for p in self.model.parameters():
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                total_norm = total_norm**0.5
                 if wandb_run is not None:
+                    # Compute the norm of gradients
+                    total_norm = 0
+                    for p in self.model.parameters():
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+
                     wandb_run.log({"grad_norm": total_norm})
                     wandb_run.log({"batch_loss": loss.item()})
                 # grad_norms.append(total_norm)
@@ -600,10 +612,13 @@ def sample(
                     t = torch.tensor([ts[i]], dtype=torch.float32, device=device)
                     tm1 = torch.tensor([ts[i + 1]], dtype=torch.float32, device=device)
 
-                    alpha_t = model.get_alpha(t).expand(exp_shape)
-                    alpha_tm1 = model.get_alpha(tm1).expand(exp_shape)
-                    sigma_t = model.get_sigma(t).expand(exp_shape)
-                    sigma_tm1 = model.get_sigma(tm1).expand(exp_shape)
+                    alpha_t, sigma_t = model.get_alpha_and_sigma(t, exp_shape)
+                    alpha_tm1, sigma_tm1 = model.get_alpha_and_sigma(tm1, exp_shape)
+                    # alpha_t = model.get_alpha(t).expand(exp_shape)
+                    # sigma_t = model.get_sigma(t).expand(exp_shape)
+
+                    # alpha_tm1 = model.get_alpha(tm1).expand(exp_shape)
+                    # sigma_tm1 = model.get_sigma(tm1).expand(exp_shape)
 
                     # assert not torch.isnan(x).any(), f"step: {i}"
                     if torch.isnan(x).any():
@@ -704,20 +719,20 @@ def sample_pieter(
 
 def train_diffusion():
     # TODO: make these into args
-    obs_key = "img"
+    obs_key = "state"  # "img"
     device = "cuda"
-    batch_size = 256
+    batch_size = 4096
     n_obs_history = 8
     n_pred_horizon = 8
     diffusion_step_embed_dim = 256
-    n_epochs = 250
+    n_epochs = 100
     lr = 3e-4
     use_ema_helper = True
-    path = (
-        "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
+    path = ("/home/matteogu/ssd_data/data_diffusion/pusht/pusht_cchi_v7_replay.zarr"
+            # "/nas/ucb/ebronstein/lsdp/diffusion_policy/data/pusht/pusht_cchi_v7_replay.zarr"
     )
     root_save_dir = "models/diffusion/"
-    load_dir = "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
+    load_dir = None  # "models/diffusion/pusht_unet1d_img_128_256_512_1024_edim_256_obs_8_pred_8_bs_256_lr_0.0003_e_250_ema_norm_latent_uniform/2024-05-06_01-09-27"
     save_freq = 30
     # Options: "standard_normal", "uniform", False
     normalize_latent = "uniform"
@@ -746,7 +761,7 @@ def train_diffusion():
         # Load VAE.
         vae_model_path = "/nas/ucb/ebronstein/lsdp/models/pusht_vae/vae_32_20240403.pt"
         vae_model = VanillaVAE(
-            in_channels=3,
+            in_channels=C,
             in_height=H,
             in_width=W,
             latent_dim=latent_dim,
@@ -770,25 +785,16 @@ def train_diffusion():
     val_idxs = np.where(val_mask)[0]
     train_idxs = np.where(~val_mask)[0]
 
+    dataset_params = {'n_obs_history': n_obs_history,
+                      'n_pred_horizon': n_pred_horizon,
+                      'include_keys': include_keys,
+                      'process_fns': process_fns,
+                      'device': device}
+
     # Make the episode dataset and create a DataLoader.
-    train_episode_dataset = EpisodeDataset(
-        dataset,
-        n_obs_history=n_obs_history,
-        n_pred_horizon=n_pred_horizon,
-        episode_idxs=train_idxs,
-        include_keys=include_keys,
-        process_fns=process_fns,
-        device=device,
-    )
-    val_episode_dataset = EpisodeDataset(
-        dataset,
-        n_obs_history=n_obs_history,
-        n_pred_horizon=n_pred_horizon,
-        episode_idxs=val_idxs,
-        include_keys=include_keys,
-        process_fns=process_fns,
-        device=device,
-    )
+    train_episode_dataset = EpisodeDataset(dataset, episode_idxs=train_idxs, **dataset_params)
+    val_episode_dataset = EpisodeDataset(dataset, episode_idxs=val_idxs, **dataset_params)
+
     train_loader = torch.utils.data.DataLoader(
         train_episode_dataset, batch_size=batch_size, shuffle=True
     )
@@ -826,6 +832,7 @@ def train_diffusion():
                 max_val=torch.tensor(latent_max, dtype=torch.float32, device=device),
             )
     else:
+        # The states are already normalized in the dataset range [-1, 1]
         obs_normalizer = None
 
     if n_pred_horizon == 1:

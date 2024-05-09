@@ -1,3 +1,9 @@
+latent_ode/*
+*.json
+PyTorch_VAE
+models/diffusion/*
+*tmp*
+
 *.avi
 *.gif
 bin
