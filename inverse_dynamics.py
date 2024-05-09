@@ -26,6 +26,28 @@ from utils import (
 from vae import VanillaVAE
 
 
+class InverseDynamicsMLP(nn.Module):
+    def __init__(
+        self, n_obs: int, obs_dim: int, action_dim: int, hidden_dims: list[int]
+    ):
+        super().__init__()
+
+        layers = []
+        in_dim = n_obs * obs_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, action_dim))
+        layers.append(nn.Tanh())
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, obs_history: torch.Tensor) -> torch.Tensor:
+        x = obs_history.flatten(start_dim=1)
+        x = self.model(x)
+        return x
+
+
 class InverseDynamicsCNN(nn.Module):
     def __init__(
         self,
@@ -314,7 +336,7 @@ def train_inverse_dynamics(args):
     obs_key = "img"
     if root_save_dir is not None:
         name = (
-            f'pusht_cnn-{obs_key}-'
+            f"pusht_cnn-{obs_key}-"
             f"obs_{n_obs_history}-bs_{batch_size}-lr_{lr}-epochs_{args.n_epochs}-"
             f"train_on_recon-{train_on_recon}-latent_dim_{latent_dim}"
         )
@@ -341,7 +363,6 @@ def train_inverse_dynamics(args):
 
     # Plot losses.
     plot_losses(train_losses, test_losses, save_dir=save_dir)
-
 
 
 if __name__ == "__main__":
